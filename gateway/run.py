@@ -7361,6 +7361,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.debug("Failed to launch systemd planned-restart helper: %s", e)
 
+    def _restart_dashboard_service_best_effort(self) -> None:
+        """Best-effort restart of the dashboard user service.
+
+        The dashboard is optional, so failures are logged and ignored.
+        """
+        import subprocess
+
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "restart", "hermes-dashboard"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            logger.info("Requested hermes-dashboard service restart")
+        except Exception as e:
+            logger.debug("Dashboard restart skipped/failed: %s", e)
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
@@ -14914,8 +14933,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if key == prefix or key.startswith(prefix + ":"):
                 matches.append(key)
         return matches
-
-
 
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:

@@ -78,6 +78,22 @@ processes (manage them via `hermes -p <name> gateway …`), each profile's
 session database, and cron schedulers (the Cron page already aggregates
 across profiles with its own filter).
 
+### Run as a systemd user service (Linux)
+
+If you want the dashboard managed like the gateway user service, use the standalone helper script:
+
+```bash
+./scripts/hermes-dashboard install
+systemctl --user start hermes-dashboard
+journalctl --user -u hermes-dashboard -f
+```
+
+The service runs:
+
+```bash
+hermes dashboard --no-open
+```
+
 ## Prerequisites
 
 The default `hermes-agent` install does not ship the HTTP stack or PTY helper — those are optional extras. The **web dashboard** needs FastAPI and Uvicorn (`web` extra). The **Chat** tab also needs `ptyprocess` to spawn the embedded TUI behind a pseudo-terminal (`pty` extra on POSIX). Install both with:

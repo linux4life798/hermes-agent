@@ -21,6 +21,7 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
+    runner._restart_dashboard_service_best_effort = MagicMock()
     event = MessageEvent(
         text="/restart",
         message_type=MessageType.TEXT,
@@ -45,6 +46,27 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     assert "Draining" in expected and "1" in expected
     running_agent.interrupt.assert_not_called()
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+    runner._restart_dashboard_service_best_effort.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_restart_command_restarts_dashboard_in_service_mode(monkeypatch):
+    monkeypatch.setenv("INVOCATION_ID", "systemd-test")
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    runner._restart_dashboard_service_best_effort = MagicMock()
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m1-service",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result.startswith("♻ Restarting gateway")
+    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+    runner._restart_dashboard_service_best_effort.assert_called_once_with()
 
 
 @pytest.mark.asyncio

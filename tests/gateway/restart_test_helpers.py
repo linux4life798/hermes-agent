@@ -142,6 +142,9 @@ def make_restart_runner(
     runner._launch_detached_restart_command = GatewayRunner._launch_detached_restart_command.__get__(
         runner, GatewayRunner
     )
+    runner._restart_dashboard_service_best_effort = (
+        GatewayRunner._restart_dashboard_service_best_effort.__get__(runner, GatewayRunner)
+    )
     runner.request_restart = GatewayRunner.request_restart.__get__(runner, GatewayRunner)
     runner._is_user_authorized = lambda _source: True
     runner.hooks = MagicMock()
