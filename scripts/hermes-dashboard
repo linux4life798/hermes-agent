@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+Hermes Dashboard - Standalone web dashboard service helper.
+
+This mirrors the standalone gateway helper pattern for the local web dashboard.
+It can run the dashboard in the foreground or install/manage a systemd user
+service that starts Hermes with `dashboard --no-open`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+PROJECT_DIR = SCRIPT_DIR.parent
+sys.path.insert(0, str(PROJECT_DIR))
+
+SERVICE_NAME = "hermes-dashboard"
+SERVICE_DESCRIPTION = "Hermes Agent Web Dashboard"
+
+
+def systemd_quote(value: str) -> str:
+    """Quote a value for use in a systemd unit file."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def systemd_escape_path(value: str) -> str:
+    """Escape a filesystem path for path-valued systemd directives."""
+    return value.replace("\\", "\\\\").replace(" ", "\\x20")
+
+
+def get_systemd_unit_path() -> Path:
+    """Return the path to the systemd user service file."""
+    return Path.home() / ".config" / "systemd" / "user" / f"{SERVICE_NAME}.service"
+
+
+def get_venv_dir() -> Path:
+    """Return the canonical repo virtualenv path."""
+    return PROJECT_DIR / ".venv"
+
+
+def get_python_path() -> str:
+    """Use the canonical repo .venv python."""
+    return str(get_venv_dir() / "bin" / "python")
+
+
+def generate_systemd_unit() -> str:
+    """Generate the systemd user unit for the dashboard."""
+    python_path = get_python_path()
+    working_dir = str(PROJECT_DIR)
+    venv_dir = get_venv_dir()
+    venv_bin = venv_dir / "bin"
+    node_bin = PROJECT_DIR / "node_modules" / ".bin"
+
+    path_entries: list[str] = []
+    for candidate in [str(venv_bin), str(node_bin), *os.environ.get("PATH", "").split(":"), "/usr/local/bin", "/usr/bin", "/bin"]:
+        if candidate and candidate not in path_entries:
+            path_entries.append(candidate)
+    sane_path = ":".join(path_entries)
+    environment_lines = [f"Environment={systemd_quote(f'PATH={sane_path}')}"]
+    environment_lines.append(
+        f"Environment={systemd_quote(f'VIRTUAL_ENV={str(venv_dir)}')}"
+    )
+    environment_block = "\n".join(environment_lines)
+
+    return f"""[Unit]
+Description={SERVICE_DESCRIPTION}
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart={systemd_quote(python_path)} -m hermes_cli.main dashboard --no-open
+WorkingDirectory={systemd_escape_path(working_dir)}
+{environment_block}
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def run_systemctl(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a systemctl --user command."""
+    try:
+        return subprocess.run(["systemctl", "--user", *args], check=check)
+    except FileNotFoundError as exc:
+        raise RuntimeError("systemctl is not available on this system") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"systemctl --user {' '.join(args)} failed with exit code {exc.returncode}") from exc
+
+
+def install_systemd() -> None:
+    """Install and enable the dashboard systemd user service."""
+    unit_path = get_systemd_unit_path()
+    try:
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text(generate_systemd_unit(), encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"failed to write systemd unit: {exc}") from exc
+
+    run_systemctl("daemon-reload")
+    run_systemctl("enable", SERVICE_NAME)
+
+    print(f"✓ Installed {SERVICE_NAME} to {unit_path}")
+    print(f"  Start with: systemctl --user start {SERVICE_NAME}")
+    print(f"  Logs: journalctl --user -u {SERVICE_NAME} -f")
+
+
+def uninstall_systemd() -> None:
+    """Remove the dashboard systemd user service."""
+    unit_path = get_systemd_unit_path()
+    run_systemctl("stop", SERVICE_NAME, check=False)
+    run_systemctl("disable", SERVICE_NAME, check=False)
+    if unit_path.exists():
+        try:
+            unit_path.unlink()
+        except OSError as exc:
+            raise RuntimeError(f"failed to remove systemd unit: {exc}") from exc
+    run_systemctl("daemon-reload")
+    print(f"✓ Uninstalled {SERVICE_NAME}")
+
+
+def systemd_start() -> None:
+    run_systemctl("start", SERVICE_NAME)
+    print("✓ Service started")
+
+
+def systemd_stop() -> None:
+    run_systemctl("stop", SERVICE_NAME)
+    print("✓ Service stopped")
+
+
+def systemd_restart() -> None:
+    run_systemctl("restart", SERVICE_NAME)
+    print("✓ Service restarted")
+
+
+def systemd_status() -> None:
+    run_systemctl("status", SERVICE_NAME, check=False)
+
+
+def run_dashboard() -> None:
+    """Replace the current process with `hermes dashboard --no-open`."""
+    python_path = get_python_path()
+    os.execv(
+        python_path,
+        [python_path, "-m", "hermes_cli.main", "dashboard", "--no-open"],
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run or manage the Hermes dashboard systemd user service"
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        default="run",
+        choices=["run", "install", "uninstall", "start", "stop", "restart", "status"],
+        help="Action to perform (default: run)",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    try:
+        if args.action == "run":
+            run_dashboard()
+        elif args.action == "install":
+            install_systemd()
+        elif args.action == "uninstall":
+            uninstall_systemd()
+        elif args.action == "start":
+            systemd_start()
+        elif args.action == "stop":
+            systemd_stop()
+        elif args.action == "restart":
+            systemd_restart()
+        elif args.action == "status":
+            systemd_status()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
+if __name__ == "__main__":
+    main()

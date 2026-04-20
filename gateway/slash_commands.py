@@ -1601,6 +1601,7 @@ class GatewaySlashCommandsMixin:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
         active_agents = self._running_agent_count()
+        self._restart_dashboard_service_best_effort()
         # When running under a service manager (systemd/launchd) or inside a
         # Docker/Podman container, use the service restart path: exit with
         # code 75 so the service manager / container restart policy restarts
