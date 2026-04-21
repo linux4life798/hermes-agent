@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import logging
+import mimetypes
 import os
 import random
 import shutil
@@ -189,6 +190,37 @@ def _remux_aac_to_m4a(aac_data: bytes) -> Optional[Tuple[bytes, str]]:
     except Exception:
         logger.exception("Signal: AAC→M4A remux error")
         return None
+
+
+def _file_to_signal_data_uri(file_path: str) -> str:
+    """Convert a local file into a signal-cli-compatible attachment data URI."""
+    path = Path(file_path)
+    mime_type = mimetypes.guess_type(path.name)[0] or _ext_to_mime(path.suffix)
+    encoded_name = quote(path.name, safe="")
+    encoded_data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};filename={encoded_name};base64,{encoded_data}"
+
+
+def _is_data_uri_attachment(file_ref: str) -> bool:
+    return isinstance(file_ref, str) and file_ref.startswith("data:")
+
+
+def _signal_attachment_size(file_ref: str) -> int:
+    if _is_data_uri_attachment(file_ref):
+        header, _, payload = file_ref.partition(",")
+        if not payload:
+            return 0
+        if ";base64" in header.lower():
+            return len(base64.b64decode(payload))
+        return len(unquote(payload).encode("utf-8"))
+    return Path(file_ref).stat().st_size
+
+
+def _normalize_signal_attachment(file_ref: str) -> str:
+    """Return an attachment reference signal-cli accepts over JSON-RPC."""
+    if _is_data_uri_attachment(file_ref):
+        return file_ref
+    return _file_to_signal_data_uri(file_ref)
 
 
 def _render_mentions(text: str, mentions: list) -> str:
@@ -1228,7 +1260,11 @@ class SignalAdapter(BasePlatformAdapter):
                 skipped_oversize += 1
                 continue
 
-            attachments.append(file_path)
+            # signal-cli's HTTP JSON-RPC daemon may be running on a different
+            # machine than Hermes, so local filesystem paths are not valid
+            # attachment references at the RPC boundary. Keep validation on the
+            # local path above, but send the actual bytes in-band as a data URI.
+            attachments.append(_normalize_signal_attachment(file_path))
 
         if not attachments:
             logger.error(
@@ -1385,18 +1421,18 @@ class SignalAdapter(BasePlatformAdapter):
                 logger.warning("Signal: failed to download image: %s", e)
                 return SendResult(success=False, error=str(e))
 
-        if not file_path or not Path(file_path).exists():
+        if not file_path or (not _is_data_uri_attachment(file_path) and not Path(file_path).exists()):
             return SendResult(success=False, error="Image file not found")
 
         # Validate size
-        file_size = Path(file_path).stat().st_size
+        file_size = _signal_attachment_size(file_path)
         if file_size > SIGNAL_MAX_ATTACHMENT_SIZE:
             return SendResult(success=False, error=f"Image too large ({file_size} bytes)")
 
         params: Dict[str, Any] = {
             "account": self.account,
             "message": caption or "",
-            "attachments": [file_path],
+            "attachments": [_normalize_signal_attachment(file_path)],
         }
 
         if chat_id.startswith("group:"):
@@ -1428,7 +1464,7 @@ class SignalAdapter(BasePlatformAdapter):
         await self._stop_typing_indicator(chat_id)
 
         try:
-            file_size = Path(file_path).stat().st_size
+            file_size = _signal_attachment_size(file_path)
         except FileNotFoundError:
             return SendResult(success=False, error=f"{media_label} file not found: {file_path}")
 
@@ -1438,7 +1474,7 @@ class SignalAdapter(BasePlatformAdapter):
         params: Dict[str, Any] = {
             "account": self.account,
             "message": caption or "",
-            "attachments": [file_path],
+            "attachments": [_normalize_signal_attachment(file_path)],
         }
 
         if chat_id.startswith("group:"):

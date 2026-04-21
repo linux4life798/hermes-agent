@@ -6,13 +6,16 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import re
 import ssl
 import time
 from email.utils import formatdate
+from urllib.parse import quote
 
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
@@ -155,6 +158,17 @@ def _display_chat_id(platform_name: str, chat_id: str) -> str:
     if platform_name == "signal" and str(chat_id).startswith("group:"):
         return "group:***"
     return chat_id
+
+
+def _signal_attachment_to_data_uri(file_ref: str) -> str:
+    """Convert a local Signal attachment file path to an in-band data URI."""
+    if isinstance(file_ref, str) and file_ref.startswith("data:"):
+        return file_ref
+    mime_type = mimetypes.guess_type(file_ref)[0] or "application/octet-stream"
+    encoded_name = quote(os.path.basename(file_ref), safe="")
+    with open(file_ref, "rb") as fh:
+        encoded_data = base64.b64encode(fh.read()).decode("ascii")
+    return f"data:{mime_type};filename={encoded_name};base64,{encoded_data}"
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -1630,20 +1644,22 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             return {"error": "Signal account not configured"}
 
         valid_media = media_files or []
-        attachment_paths = []
+        attachment_refs = []
         for media_path, _is_voice in valid_media:
-            if os.path.exists(media_path):
-                attachment_paths.append(media_path)
+            if isinstance(media_path, str) and media_path.startswith("data:"):
+                attachment_refs.append(media_path)
+            elif os.path.exists(media_path):
+                attachment_refs.append(_signal_attachment_to_data_uri(media_path))
             else:
                 logger.warning("Signal media file not found, skipping: %s", media_path)
 
         # Chunk attachments. With no attachments we still emit one batch
         # (text only). With attachments, the text rides on batch #0 so the
         # caption isn't repeated across every chunk.
-        if attachment_paths:
+        if attachment_refs:
             att_batches = [
-                attachment_paths[i:i + SIGNAL_MAX_ATTACHMENTS_PER_MSG]
-                for i in range(0, len(attachment_paths), SIGNAL_MAX_ATTACHMENTS_PER_MSG)
+                attachment_refs[i:i + SIGNAL_MAX_ATTACHMENTS_PER_MSG]
+                for i in range(0, len(attachment_refs), SIGNAL_MAX_ATTACHMENTS_PER_MSG)
             ]
         else:
             att_batches = [[]]
@@ -1700,7 +1716,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         scheduler = get_scheduler()
         logger.info(
             "send_message Signal: scheduler state=%s, %d attachment(s) in %d batch(es)",
-            scheduler.state(), len(attachment_paths), len(att_batches),
+            scheduler.state(), len(attachment_refs), len(att_batches),
         )
         failed_batches: list[int] = []
         for idx, att_batch in enumerate(att_batches):
@@ -1764,7 +1780,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                     )
 
         warnings = []
-        if len(attachment_paths) < len(valid_media):
+        if len(attachment_refs) < len(valid_media):
             warnings.append("Some media files were skipped (not found on disk)")
         if failed_batches:
             warnings.append(
