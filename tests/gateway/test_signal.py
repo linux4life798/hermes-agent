@@ -513,8 +513,9 @@ class TestSignalSendImageFile:
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
 
+        img_bytes = b"\x89PNG" + b"\x00" * 100
         img_path = tmp_path / "chart.png"
-        img_path.write_bytes(b"\x89PNG" + b"\x00" * 100)
+        img_path.write_bytes(img_bytes)
 
         result = await adapter.send_image_file(chat_id="+155****4567", image_path=str(img_path))
 
@@ -523,7 +524,9 @@ class TestSignalSendImageFile:
         assert captured[0]["method"] == "send"
         assert captured[0]["params"]["account"] == adapter.account
         assert captured[0]["params"]["recipient"] == ["+155****4567"]
-        assert captured[0]["params"]["attachments"] == [str(img_path)]
+        assert captured[0]["params"]["attachments"][0].startswith("data:image/png;filename=chart.png;base64,")
+        encoded = captured[0]["params"]["attachments"][0].split(",", 1)[1]
+        assert base64.b64decode(encoded) == img_bytes
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         # Typing indicator must be stopped before sending
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
@@ -701,14 +704,17 @@ class TestSignalSendVoice:
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
 
+        audio_bytes = b"OggS" + b"\x00" * 100
         audio_path = tmp_path / "reply.ogg"
-        audio_path.write_bytes(b"OggS" + b"\x00" * 100)
+        audio_path.write_bytes(audio_bytes)
 
         result = await adapter.send_voice(chat_id="+155****4567", audio_path=str(audio_path))
 
         assert result.success is True
         assert captured[0]["method"] == "send"
-        assert captured[0]["params"]["attachments"] == [str(audio_path)]
+        assert captured[0]["params"]["attachments"][0].startswith("data:audio/ogg;filename=reply.ogg;base64,")
+        encoded = captured[0]["params"]["attachments"][0].split(",", 1)[1]
+        assert base64.b64decode(encoded) == audio_bytes
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         assert 1234567890 in adapter._recent_sent_timestamps
@@ -790,14 +796,17 @@ class TestSignalSendVideo:
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
 
+        vid_bytes = b"\x00\x00\x00\x18ftyp" + b"\x00" * 100
         vid_path = tmp_path / "demo.mp4"
-        vid_path.write_bytes(b"\x00\x00\x00\x18ftyp" + b"\x00" * 100)
+        vid_path.write_bytes(vid_bytes)
 
         result = await adapter.send_video(chat_id="+155****4567", video_path=str(vid_path))
 
         assert result.success is True
         assert captured[0]["method"] == "send"
-        assert captured[0]["params"]["attachments"] == [str(vid_path)]
+        assert captured[0]["params"]["attachments"][0].startswith("data:video/mp4;filename=demo.mp4;base64,")
+        encoded = captured[0]["params"]["attachments"][0].split(",", 1)[1]
+        assert base64.b64decode(encoded) == vid_bytes
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         assert 1234567890 in adapter._recent_sent_timestamps
@@ -876,6 +885,52 @@ class TestSignalMediaExtraction:
         assert len(media) == 1
         assert media[0][0] == "/tmp/reply.ogg"
         assert media[0][1] is True  # is_voice flag
+
+    @pytest.mark.asyncio
+    async def test_post_stream_media_tag_image_sends_signal_data_uri(
+        self, monkeypatch, tmp_path
+    ):
+        """Streaming completion path must not pass MEDIA paths to remote signal-cli."""
+        from gateway.platforms.base import MessageEvent
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, captured = _stub_rpc_responses([{"timestamp": 1234567890}])
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        img_bytes = b"\x89PNG\r\n\x1a\n" + b"payload"
+        img_path = tmp_path / "content1.png"
+        img_path.write_bytes(img_bytes)
+
+        runner = object.__new__(GatewayRunner)
+        runner._thread_metadata_for_source = lambda source, reply_to_message_id=None: None
+        runner._reply_anchor_for_event = lambda event: None
+        event = MessageEvent(
+            text="",
+            source=SessionSource(
+                platform=Platform.SIGNAL,
+                chat_id="group:abc123==",
+                chat_type="group",
+                user_id="+155****9999",
+            ),
+        )
+
+        await runner._deliver_media_from_response(
+            f"Attached without viewing:\n\nMEDIA:{img_path}",
+            event,
+            adapter,
+        )
+
+        params = captured[0]["params"]
+        assert params["groupId"] == "abc123=="
+        attachments = params["attachments"]
+        assert len(attachments) == 1
+        assert attachments[0].startswith("data:image/png;filename=content1.png;base64,")
+        assert str(img_path) not in attachments[0]
+        encoded = attachments[0].split(",", 1)[1]
+        assert base64.b64decode(encoded) == img_bytes
 
     def test_signal_has_all_media_methods(self, monkeypatch):
         """SignalAdapter must override all media send methods used by gateway."""
@@ -1935,6 +1990,30 @@ class TestSignalSendMultipleImages:
         assert len(params["attachments"]) == 5
         # raise_on_rate_limit must be opted into so the retry loop sees 429s
         assert captured[0]["kwargs"].get("raise_on_rate_limit") is True
+
+    @pytest.mark.asyncio
+    async def test_single_batch_sends_file_urls_as_data_uris(self, monkeypatch, tmp_path):
+        """Signal HTTP JSON-RPC may run on another host; never send local paths."""
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, captured = _stub_rpc_responses([{"timestamp": 1}])
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        img_bytes = b"\x89PNG\r\n\x1a\n" + b"payload"
+        img_path = tmp_path / "content1.png"
+        img_path.write_bytes(img_bytes)
+
+        await adapter.send_multiple_images(
+            chat_id="group:abc123==",
+            images=[(f"file://{img_path}", "")],
+        )
+
+        attachments = captured[0]["params"]["attachments"]
+        assert len(attachments) == 1
+        assert attachments[0].startswith("data:image/png;filename=content1.png;base64,")
+        assert str(img_path) not in attachments[0]
+        encoded = attachments[0].split(",", 1)[1]
+        assert base64.b64decode(encoded) == img_bytes
 
     @pytest.mark.asyncio
     async def test_skips_bad_images_in_mixed_batch(self, monkeypatch, tmp_path):

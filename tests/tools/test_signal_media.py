@@ -1,6 +1,7 @@
 """Tests for Signal media delivery in send_message_tool.py."""
 
 import asyncio
+import base64
 import sys
 from types import ModuleType
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -91,6 +92,51 @@ class TestSendSignalMediaFiles:
         assert result["success"] is True  # Should succeed despite missing file
         assert "warnings" in result
         assert "Some media files were skipped" in str(result["warnings"])
+
+    def test_send_signal_converts_attachment_path_to_data_uri(self, tmp_path, monkeypatch):
+        """Signal sends local files in-band as data: URIs over JSON-RPC."""
+        from tools.send_message_tool import _send_signal
+
+        img_bytes = b"\x89PNG\r\n\x1a\n\x00payload"
+        img_path = tmp_path / "test image.png"
+        img_path.write_bytes(img_bytes)
+
+        captured = {}
+
+        class CaptureResp:
+            status_code = 200
+
+            def json(self):
+                return {"timestamp": 1234567890}
+
+            def raise_for_status(self):
+                pass
+
+        class CaptureClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def post(self, url, json=None, **kwargs):
+                captured["url"] = url
+                captured["json"] = json
+                return CaptureResp()
+
+        monkeypatch.setattr(sys.modules["httpx"], "AsyncClient", lambda timeout=None: CaptureClient())
+
+        extra = {"http_url": "http://localhost:8080", "account": "+155****4567"}
+        result = asyncio.run(
+            _send_signal(extra, "+155****9999", "Check this out", media_files=[(str(img_path), False)])
+        )
+
+        assert result["success"] is True
+        attachments = captured["json"]["params"]["attachments"]
+        assert len(attachments) == 1
+        assert attachments[0].startswith("data:image/png;filename=test%20image.png;base64,")
+        encoded = attachments[0].split(",", 1)[1]
+        assert base64.b64decode(encoded) == img_bytes
 
 
 class TestSendSignalMediaRestrictions:
