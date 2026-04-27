@@ -22,6 +22,8 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 logger = logging.getLogger(__name__)
 
+_CODEX_NATIVE_TOOL_TYPES = {"web_search", "web_search_preview"}
+
 
 def _classify_responses_issuer(
     *,
@@ -842,6 +844,31 @@ def _preflight_codex_input_items(
     return normalized
 
 
+def _normalize_codex_native_tool(tool: Dict[str, Any]) -> Dict[str, Any]:
+    tool_type = tool.get("type")
+    if tool_type not in _CODEX_NATIVE_TOOL_TYPES:
+        raise ValueError(f"Unsupported Codex native tool type {tool_type!r}.")
+
+    native_tool: Dict[str, Any] = {"type": tool_type}
+
+    if isinstance(tool.get("external_web_access"), bool):
+        native_tool["external_web_access"] = tool["external_web_access"]
+
+    search_context_size = tool.get("search_context_size")
+    if isinstance(search_context_size, str) and search_context_size.strip():
+        native_tool["search_context_size"] = search_context_size.strip()
+
+    user_location = tool.get("user_location")
+    if isinstance(user_location, dict):
+        native_tool["user_location"] = user_location
+
+    filters = tool.get("filters")
+    if isinstance(filters, dict):
+        native_tool["filters"] = filters
+
+    return native_tool
+
+
 def _preflight_codex_api_kwargs(
     api_kwargs: Any,
     *,
@@ -882,23 +909,27 @@ def _preflight_codex_api_kwargs(
         for idx, tool in enumerate(tools):
             if not isinstance(tool, dict):
                 raise ValueError(f"Codex Responses tools[{idx}] must be an object.")
-
             tool_type = tool.get("type")
 
             # Provider-executed built-in tools (xAI native web_search, code
             # interpreter, etc.) are declared by ``type`` alone and carry no
             # ``name``/``parameters`` schema — the provider owns the
-            # implementation.  Pass them through verbatim instead of forcing
-            # them through the function-tool validation below (which would
-            # otherwise reject them with "unsupported type").  See
-            # agent/transports/codex.py for where xAI's native web_search is
-            # injected.
+            # implementation.  Pass them through instead of forcing them
+            # through the function-tool validation below (which would
+            # otherwise reject them with "unsupported type").  The local
+            # Codex-native web-search feature keeps a narrower normalizer for
+            # its supported web-search declarations; other server-side builtins
+            # pass through verbatim for upstream compatibility.
+            if tool_type in _CODEX_NATIVE_TOOL_TYPES:
+                normalized_tools.append(_normalize_codex_native_tool(tool))
+                continue
+
             if tool_type in _RESPONSES_BUILTIN_TOOL_TYPES:
                 normalized_tools.append(dict(tool))
                 continue
 
             if tool_type != "function":
-                raise ValueError(f"Codex Responses tools[{idx}] has unsupported type {tool.get('type')!r}.")
+                raise ValueError(f"Codex Responses tools[{idx}] has unsupported type {tool_type!r}.")
 
             name = tool.get("name")
             parameters = tool.get("parameters")
