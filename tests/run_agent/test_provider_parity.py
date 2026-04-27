@@ -1234,6 +1234,7 @@ class TestReasoningEffortDefaults:
         assert kwargs["reasoning"]["effort"] == "medium"
 
     def test_codex_reasoning_disabled(self, monkeypatch):
+        monkeypatch.delenv("HERMES_CODEX_NATIVE_WEB_SEARCH", raising=False)
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
         agent.reasoning_config = {"enabled": False}

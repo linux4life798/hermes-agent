@@ -403,6 +403,30 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _codex_native_web_search_enabled() -> bool:
+    """Compatibility forwarder for tests/importers; implementation lives in helper module."""
+    from agent.chat_completion_helpers import _codex_native_web_search_enabled as _impl
+    return _impl()
+
+
+def _codex_native_web_search_disable_managed_enabled() -> bool:
+    """Compatibility forwarder for tests/importers; implementation lives in helper module."""
+    from agent.chat_completion_helpers import _codex_native_web_search_disable_managed_enabled as _impl
+    return _impl()
+
+
+def _is_managed_web_search_tool(tool: Any) -> bool:
+    """Compatibility forwarder for tests/importers; implementation lives in helper module."""
+    from agent.chat_completion_helpers import _is_managed_web_search_tool as _impl
+    return _impl(tool)
+
+
+def _maybe_add_codex_native_web_search(agent: Any, api_kwargs: Dict[str, Any]) -> None:
+    """Compatibility forwarder for tests/importers; implementation lives in helper module."""
+    from agent.chat_completion_helpers import _maybe_add_codex_native_web_search as _impl
+    return _impl(agent, api_kwargs)
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.

@@ -121,6 +121,10 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     return _chars(api_payload) // 4
 
 
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_CODEX_NATIVE_WEB_SEARCH_TOOL_TYPES = {"web_search", "web_search_preview"}
+
+
 def _is_openai_codex_backend(agent) -> bool:
     base_url_lower = str(getattr(agent, "_base_url_lower", "") or "")
     base_url_hostname = str(getattr(agent, "_base_url_hostname", "") or "")
@@ -367,6 +371,56 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
         if floor is not None:
             return floor
     return None
+def _codex_native_web_search_enabled() -> bool:
+    return os.getenv("HERMES_CODEX_NATIVE_WEB_SEARCH", "").strip().lower() in _TRUE_ENV_VALUES
+
+
+def _codex_native_web_search_disable_managed_enabled() -> bool:
+    return (
+        os.getenv("HERMES_CODEX_NATIVE_WEB_SEARCH_DISABLE_MANAGED", "").strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _is_managed_web_search_tool(tool: Any) -> bool:
+    if not isinstance(tool, dict) or tool.get("type") != "function":
+        return False
+
+    name = tool.get("name")
+    function = tool.get("function")
+    if name is None and isinstance(function, dict):
+        name = function.get("name")
+    return name == "web_search"
+
+
+def _maybe_add_codex_native_web_search(agent: Any, api_kwargs: Dict[str, Any]) -> None:
+    if not (
+        getattr(agent, "api_mode", None) == "codex_responses"
+        and _is_openai_codex_backend(agent)
+        and _codex_native_web_search_enabled()
+    ):
+        return
+
+    tools = api_kwargs.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+        api_kwargs["tools"] = tools
+
+    if _codex_native_web_search_disable_managed_enabled():
+        tools[:] = [tool for tool in tools if not _is_managed_web_search_tool(tool)]
+
+    if not any(
+        isinstance(tool, dict) and tool.get("type") in _CODEX_NATIVE_WEB_SEARCH_TOOL_TYPES
+        for tool in tools
+    ):
+        tools.append({"type": "web_search", "external_web_access": True})
+
+    includes = api_kwargs.get("include")
+    if not isinstance(includes, list):
+        includes = []
+    if "web_search_call.action.sources" not in includes:
+        includes.append("web_search_call.action.sources")
+    api_kwargs["include"] = includes
 
 
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
@@ -1070,7 +1124,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
-        return _ct.build_kwargs(
+        api_kwargs = _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
@@ -1088,6 +1142,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
         )
+        _maybe_add_codex_native_web_search(agent, api_kwargs)
+        return api_kwargs
 
     # ── chat_completions (default) ─────────────────────────────────────
     _ct = agent._get_transport()
