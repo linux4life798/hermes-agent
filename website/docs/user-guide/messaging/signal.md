@@ -108,7 +108,8 @@ SIGNAL_ALLOWED_USERS=+1234567890,+0987654321    # Comma-separated E.164 numbers 
 
 # Optional
 SIGNAL_GROUP_ALLOWED_USERS=groupId1,groupId2     # Enable groups (omit to disable, * for all)
-SIGNAL_HOME_CHANNEL=+1234567890                  # Default delivery target for cron jobs
+SIGNAL_REQUIRE_MENTION=true                      # In groups, observe all messages but reply only when @mentioned
+SIGNAL_HOME_CHANNEL=+123****7890                  # Default delivery target for cron jobs
 ```
 
 Then start the gateway:

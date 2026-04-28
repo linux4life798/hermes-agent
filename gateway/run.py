@@ -11403,6 +11403,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 _update_prompts.pop(_quick_key, None)
 
+        # Observe-only messages are appended to the shared session transcript
+        # for later context, but they must not invoke the LLM, run slash
+        # commands, show typing indicators, answer pending clarify prompts, or
+        # send a response. Signal uses this for mention-gated groups:
+        # unmentioned chatter is remembered; only an actual @mention wakes the
+        # agent up.
+        if getattr(event, "observe_only", False) is True:
+            try:
+                session_entry = await self.async_session_store.get_or_create_session(source)
+                user_label = source.user_name or source.user_id or "unknown"
+                content = event.text or ""
+                if event.media_urls:
+                    media_bits = []
+                    for idx, media_url in enumerate(event.media_urls):
+                        media_type = event.media_types[idx] if idx < len(event.media_types) else "media"
+                        media_bits.append(f"{media_type}: {media_url}")
+                    media_text = "; ".join(media_bits)
+                    content = f"{content}\n[Attachments: {media_text}]" if content else f"[Attachments: {media_text}]"
+                await self.async_session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {
+                        "role": "user",
+                        "content": f"[Observed group message from {user_label}]: {content}",
+                    },
+                )
+                logger.info(
+                    "[observe] Recorded %s message from %s in session %s",
+                    source.platform.value if source.platform else "unknown",
+                    user_label,
+                    session_entry.session_id[:20],
+                )
+            except Exception as e:
+                logger.warning("[observe] Failed to record observe-only message: %s", e)
+            return None
+
         # Intercept messages that are responses to a pending clarify.
         # Open-ended prompts and "Other" responses are captured as free text;
         # direct replies to multi-choice prompts are accepted too ("2" maps
@@ -11509,6 +11544,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
+
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages

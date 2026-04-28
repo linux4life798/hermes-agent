@@ -82,6 +82,15 @@ def _parse_comma_list(value: str) -> List[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _is_truthy(value: Any, default: bool = False) -> bool:
+    """Parse common config/env truthy values."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
 def _guess_extension(data: bytes) -> str:
     """Guess file extension from magic bytes.
 
@@ -244,6 +253,23 @@ def _render_mentions(text: str, mentions: list) -> str:
     return text
 
 
+def _signal_mentions_include_bot(mentions: list, bot_identifiers: set[str]) -> bool:
+    """Return True when Signal mention metadata targets this bot."""
+    if not mentions or not bot_identifiers:
+        return False
+    for mention in mentions:
+        if not isinstance(mention, dict):
+            continue
+        values = {
+            str(mention.get(key) or "").strip()
+            for key in ("number", "uuid", "serviceId", "recipient")
+        }
+        values.discard("")
+        if values & bot_identifiers:
+            return True
+    return False
+
+
 def _is_signal_service_id(value: str) -> bool:
     """Return True if *value* already looks like a Signal service identifier."""
     if not value:
@@ -306,10 +332,10 @@ class SignalAdapter(BasePlatformAdapter):
         # Mention filter — only respond in groups when the bot account is @mentioned.
         # Read from config extra first, then SIGNAL_REQUIRE_MENTION env var.
         _rm_cfg = extra.get("require_mention")
-        if _rm_cfg is not None:
-            self.require_mention = bool(_rm_cfg)
-        else:
-            self.require_mention = os.getenv("SIGNAL_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
+        self.require_mention = _is_truthy(
+            _rm_cfg,
+            default=_is_truthy(os.getenv("SIGNAL_REQUIRE_MENTION"), default=False),
+        )
 
         # DM allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
         # Stored here so the reaction hooks can skip unauthorized senders
@@ -645,28 +671,32 @@ class SignalAdapter(BasePlatformAdapter):
         chat_id = sender if not is_group else f"group:{group_id}"
         chat_type = "group" if is_group else "dm"
 
-        # Extract text and render mentions
+        # Extract text and render mentions.  When require_mention is enabled,
+        # keep allowed-but-unmentioned group messages as observe-only context
+        # instead of dropping them here; GatewayRunner records observe-only
+        # events without invoking the LLM or sending a response.
         text = data_message.get("message", "")
         mentions = data_message.get("mentions", [])
+        bot_identifiers = {self._account_normalized} if self._account_normalized else set()
+        cached_bot_uuid = self._recipient_uuid_by_number.get(self._account_normalized)
+        if cached_bot_uuid:
+            bot_identifiers.add(cached_bot_uuid)
+        if _is_signal_service_id(self._account_normalized):
+            bot_identifiers.add(self._account_normalized)
+        metadata_mentions_bot = _signal_mentions_include_bot(mentions, bot_identifiers)
         if text and mentions:
             text = _render_mentions(text, mentions)
-
-        # Mention filter: in groups, only process messages that @mention the bot account
-        if is_group and self.require_mention:
-            account_norm = self._account_normalized
-            # Check rendered mention tags OR raw mention metadata
-            mentioned_in_text = account_norm and (
-                f"@{account_norm}" in (text or "")
-            )
-            mentioned_in_metadata = any(
-                m.get("number") == account_norm or m.get("uuid") == account_norm
-                for m in (data_message.get("mentions") or [])
-            )
-            if not mentioned_in_text and not mentioned_in_metadata:
-                logger.debug(
-                    "Signal: ignoring group message (require_mention=true, bot not mentioned)"
-                )
-                return
+        rendered_mentions_bot = bool(
+            text
+            and any(f"@{identifier}" in text for identifier in bot_identifiers)
+        )
+        was_mentioned = metadata_mentions_bot or rendered_mentions_bot
+        observe_only = False
+        if is_group and self.require_mention and not was_mentioned:
+            observe_only = True
+        if text and was_mentioned:
+            for identifier in sorted(bot_identifiers, key=len, reverse=True):
+                text = text.replace(f"@{identifier}", "").strip()
 
         # Strip the bot's own @mention from any group message so the agent
         # doesn't misinterpret "@+155****4567 say hello" as a directive to
@@ -793,6 +823,7 @@ class SignalAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_to_author,
             reply_to_author_name=reply_to_author_name,
             reply_to_is_own_message=reply_to_is_own,
+            observe_only=observe_only,
         )
 
         logger.debug("Signal: message from %s in %s: %s",
