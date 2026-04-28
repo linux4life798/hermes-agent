@@ -1831,6 +1831,11 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
+
+    # Observe-only: add message to the session transcript for future context,
+    # but do not call the LLM or send a response.  Used by mention-gated group
+    # chats that should keep passive awareness without responding to chatter.
+    observe_only: bool = False
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -5107,10 +5112,12 @@ class BasePlatformAdapter(ABC):
         # Start continuous typing indicator (refreshes every 2 seconds).
         # Gated per-platform: when typing_indicator=False the refresh loop is
         # never spawned, so no "typing…" / "is thinking…" status is shown.
+        # Observe-only messages are transcript-only context updates, so they
+        # must not show typing even when the platform indicator is enabled.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
+        if getattr(self.config, "typing_indicator", True) and not event.observe_only:
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)

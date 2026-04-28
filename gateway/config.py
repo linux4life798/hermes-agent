@@ -2012,6 +2012,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "account": signal_account,
             "ignore_stories": is_truthy_value(getenv("SIGNAL_IGNORE_STORIES", "true")),
         })
+        signal_require_mention = _getenv("SIGNAL_REQUIRE_MENTION", None)
+        if signal_require_mention is not None:
+            signal_config.extra["require_mention"] = is_truthy_value(signal_require_mention)
     signal_home = getenv("SIGNAL_HOME_CHANNEL")
     if signal_home and Platform.SIGNAL in config.platforms:
         config.platforms[Platform.SIGNAL].home_channel = HomeChannel(

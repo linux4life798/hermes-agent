@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import pytest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
@@ -325,6 +326,145 @@ class TestSignalHelpers:
 
         config = PlatformConfig(enabled=True, extra={"http_url": "http://localhost:8080"})
         assert validate_signal_config(config) is False
+
+
+class TestSignalMentionObserveOnly:
+    """Signal groups should be observed passively until the bot is mentioned."""
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_group_message_is_observe_only(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            group_allowed="group123",
+            require_mention=True,
+        )
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope({
+            "sourceNumber": "+155****1111",
+            "sourceName": "Alice",
+            "timestamp": 1712345678000,
+            "dataMessage": {
+                "message": "regular group chatter",
+                "groupInfo": {"groupId": "group123", "groupName": "House"},
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.observe_only is True
+        assert event.text == "regular group chatter"
+        assert event.source.chat_id == "group:group123"
+        assert event.source.chat_type == "group"
+
+    @pytest.mark.asyncio
+    async def test_mentioned_group_message_remains_active(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            group_allowed="group123",
+            require_mention=True,
+        )
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope({
+            "sourceNumber": "+155****1111",
+            "sourceName": "Alice",
+            "timestamp": 1712345678000,
+            "dataMessage": {
+                "message": "\uFFFC please summarize",
+                "mentions": [{"start": 0, "length": 1, "number": "+15551234567"}],
+                "groupInfo": {"groupId": "group123", "groupName": "House"},
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.observe_only is False
+        assert event.text == "please summarize"
+
+    @pytest.mark.asyncio
+    async def test_mention_can_match_cached_bot_uuid(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            group_allowed="group123",
+            require_mention=True,
+        )
+        adapter._recipient_uuid_by_number["+15551234567"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope({
+            "sourceNumber": "+155****1111",
+            "sourceName": "Alice",
+            "timestamp": 1712345678000,
+            "dataMessage": {
+                "message": "\uFFFC ping",
+                "mentions": [{
+                    "start": 0,
+                    "length": 1,
+                    "uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                }],
+                "groupInfo": {"groupId": "group123", "groupName": "House"},
+            },
+        })
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.observe_only is False
+
+    def test_env_override_parses_signal_require_mention(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_HTTP_URL", "http://localhost:9090")
+        monkeypatch.setenv("SIGNAL_ACCOUNT", "+155****4567")
+        monkeypatch.setenv("SIGNAL_REQUIRE_MENTION", "true")
+
+        from gateway.config import GatewayConfig, _apply_env_overrides
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        assert config.platforms[Platform.SIGNAL].extra["require_mention"] is True
+
+    @pytest.mark.asyncio
+    async def test_gateway_records_observe_only_without_running_agent(self):
+        from gateway.platforms.base import MessageEvent
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionEntry, SessionSource
+
+        runner = object.__new__(GatewayRunner)
+        runner.session_store = MagicMock()
+        runner.session_store.get_or_create_session.return_value = SessionEntry(
+            session_key="signal:group:group123",
+            session_id="session-123",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            platform=Platform.SIGNAL,
+            chat_type="group",
+        )
+        runner.session_store._generate_session_key.return_value = "signal:group:group123"
+        runner._update_prompt_pending = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+        runner._session_key_for_source = lambda source: "signal:group:group123"
+
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="group:group123",
+            chat_name="House",
+            chat_type="group",
+            user_id="+155****1111",
+            user_name="Alice",
+        )
+        event = MessageEvent(
+            source=source,
+            text="background context",
+            observe_only=True,
+        )
+
+        result = await runner._handle_message(event)
+
+        assert result is None
+        runner.session_store.get_or_create_session.assert_called_once_with(source)
+        runner.session_store.append_to_transcript.assert_called_once()
+        session_id, entry = runner.session_store.append_to_transcript.call_args.args
+        assert session_id == "session-123"
+        assert entry["role"] == "user"
+        assert entry["content"] == "[Observed group message from Alice]: background context"
 
 
 # ---------------------------------------------------------------------------
