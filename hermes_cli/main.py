@@ -11604,7 +11604,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print(f"→ Found {commit_count} new commit(s)")
 
-        print("→ Pulling updates...")
+        print("→ Pulling updates with rebase...")
         update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
@@ -11614,32 +11614,36 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
             pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+                git_cmd + ["pull", "--rebase", "origin", branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                print("  ⚠ Rebase failed; aborting to preserve local commits...")
+                if pull_result.stdout.strip():
+                    print(pull_result.stdout.strip())
+                if pull_result.stderr.strip():
+                    print(pull_result.stderr.strip())
+
+                abort_result = subprocess.run(
+                    git_cmd + ["rebase", "--abort"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
+                if abort_result.returncode != 0:
+                    print("✗ Failed to abort the rebase automatically.")
+                    if abort_result.stdout.strip():
+                        print(abort_result.stdout.strip())
+                    if abort_result.stderr.strip():
+                        print(abort_result.stderr.strip())
+                    print("  Run manually: git rebase --abort")
                     sys.exit(1)
+
+                print("  ✓ Rebase aborted; local commits were preserved.")
+                print("  Resolve the conflict manually, then rerun hermes update.")
+                sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
@@ -11681,12 +11685,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print("  Could not capture pre-pull SHA — recover manually with:")
                     print(f"    cd {PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
                 sys.exit(1)
-
             update_succeeded = True
         finally:
             if auto_stash_ref is not None:
                 # Don't attempt stash restore if the code update itself failed —
-                # working tree is in an unknown state.
+                # a failed/aborted rebase should leave local work in the stash for
+                # explicit manual recovery instead of risking another conflict.
                 if not update_succeeded:
                     print(
                         f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"

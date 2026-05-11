@@ -789,8 +789,8 @@ class TestCmdUpdateBranchFlag:
         assert any("origin/bb/gui" in c for c in rev_list_cmds), rev_list_cmds
         assert not any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
-        # pull must target bb/gui
-        pull_cmds = [c for c in commands if "pull" in c and "ff-only" in c]
+        # Rebase pull must target bb/gui while preserving local commits.
+        pull_cmds = [c for c in commands if "pull" in c and "--rebase" in c]
         assert any("bb/gui" in c and "main" not in c.split() for c in pull_cmds), pull_cmds
 
     @patch("shutil.which", return_value=None)
