@@ -110,6 +110,34 @@ class TestMarkdownToSignalBasic:
 
 
 # ===========================================================================
+# Provider citation-marker sanitizing
+# ===========================================================================
+
+class TestCitationMarkerSanitizing:
+    """Private-use web citations must not leak into Signal messages."""
+
+    def test_strips_single_provider_citation_marker(self):
+        marker = "\ue200cite\ue202turn0search3\ue201"
+        text, styles = _m2s(f"Use the Air France lounge. {marker}")
+        assert text == "Use the Air France lounge."
+        assert styles == []
+
+    def test_strips_multi_source_marker_before_computing_styles(self):
+        marker = "\ue200cite\ue202turn0search0\ue202turn2open0\ue201"
+        text, styles = _m2s(f"**Recommended.** {marker}\n\nNext step.")
+        assert text == "Recommended.\n\nNext step."
+        bold = _find_style(styles, "BOLD")
+        assert len(bold) == 1
+        assert bold[0] == "0:12:BOLD"
+
+    def test_preserves_unrelated_private_use_text(self):
+        raw = "Keep \ue200not-a-citation\ue201 intact"
+        text, styles = _m2s(raw)
+        assert text == raw
+        assert styles == []
+
+
+# ===========================================================================
 # Italic false-positive regressions
 # ===========================================================================
 
