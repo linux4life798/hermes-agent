@@ -9,6 +9,14 @@ from __future__ import annotations
 import re
 
 
+# OpenAI/Codex web-search citations use private-use delimiters that supported
+# clients render as source links. Signal has no renderer for them, so remove the
+# complete envelope before calculating body-range offsets. Keep the pattern
+# deliberately narrow: only a complete ``\ue200cite\ue202...\ue201`` marker on
+# one line is stripped; unrelated private-use characters are preserved.
+_PROVIDER_CITATION_RE = re.compile(r"[ \t]*\ue200cite\ue202[^\ue201\r\n]*\ue201")
+
+
 def markdown_to_signal(text: str) -> tuple[str, list[str]]:
     """Convert markdown to plain text + Signal textStyles list.
 
@@ -41,6 +49,7 @@ def markdown_to_signal(text: str) -> tuple[str, list[str]]:
             parts[idx] = re.sub(r"(?m)^([ \t]{0,3})[-*+]\s+", r"\1• ", part)
         return "".join(parts)
 
+    text = _PROVIDER_CITATION_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.strip()
     text = _normalize_bullet_markers(text)
