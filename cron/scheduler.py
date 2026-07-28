@@ -621,6 +621,25 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _resolve_chat_memory_target(job: dict) -> Optional[str]:
+    """Derive the fresh cron agent's CHAT target from immutable job origin.
+
+    Delivery may be edited or fan out, and ``context_from`` imports outputs;
+    neither owns the job's durable chat context. Jobs without a messaging
+    origin intentionally receive no automatic CHAT memory.
+    """
+    origin = _resolve_origin(job)
+    if not origin:
+        return None
+    from tools.memory_tool import derive_chat_memory_target
+
+    return derive_chat_memory_target(
+        origin.get("platform"),
+        origin.get("chat_id"),
+        origin.get("thread_id"),
+    )
+
+
 def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
     """Whether a cron delivery should also be mirrored into the target chat's
     gateway session transcript.
@@ -3481,6 +3500,7 @@ def run_job(
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
+            chat_memory_target=_resolve_chat_memory_target(job),
             session_id=_cron_session_id,
             session_db=_session_db,
         )

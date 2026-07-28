@@ -250,7 +250,16 @@ This separation keeps the stable prefix stable for caching.
 
 ## Memory snapshots
 
-Local memory and user profile data are captured in the system prompt's **volatile tier**. Mid-session writes update disk state but do not mutate the already-built cached system prompt until a rebuild path runs (new session, or explicit invalidation/rebuild flow such as compression-triggered rebuild).
+Local global memory, user profile data, and one applicable CHAT store are
+captured in the system prompt's **volatile tier**. Mid-session writes update
+disk state but do not mutate the already-built cached prompt. A resumed session
+restores its persisted prompt verbatim, so moving session A through physical
+chat B keeps A's frozen CHAT block. Fresh prompts derive CHAT from their current
+origin; fresh cron agents derive it from the job's existing `origin`, never
+from `deliver` or `context_from`. The tool schema remains static and accepts
+validated `chat-<ID>` strings, avoiding per-agent mutation of memoized schemas.
+Gateway `/branch` creates the child with the parent's complete saved prompt and
+runtime model configuration as opaque values; it does not inspect CHAT text.
 
 ## Context files
 
@@ -276,7 +285,9 @@ Most users should treat `agent/prompt_builder.py` as implementation code, not a 
 ### Use these surfaces first
 
 - `~/.hermes/SOUL.md` — replace the built-in default identity block with your own agent persona and standing behavior.
-- `~/.hermes/MEMORY.md` and `~/.hermes/USER.md` — provide durable cross-session facts and user profile data that should be snapshotted into new sessions.
+- `~/.hermes/memories/MEMORY.md`, `~/.hermes/memories/USER.md`, and
+  `~/.hermes/memories/chat/<opaque-id>.md` — provide global, user, and
+  chat-scoped durable facts snapshotted into new sessions.
 - Project context files such as `.hermes.md`, `HERMES.md`, `AGENTS.md`, `CLAUDE.md`, or `.cursorrules` — inject repo-specific working rules.
 - Skills — package reusable workflows and references without editing core prompt code.
 - Optional system prompt config / API overrides — add deployment-specific instruction text without forking Hermes.

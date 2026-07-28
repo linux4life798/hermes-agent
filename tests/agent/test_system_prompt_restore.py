@@ -72,6 +72,38 @@ class TestStoredPromptReuse:
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
 
+    def test_resumed_chat_keeps_frozen_chat_target_without_rebuild(self):
+        """Physical chat B must not replace chat A inside the restored prompt."""
+        chat_a = "chat-aaaaaaaaaaaaaaaa"
+        chat_b = "chat-bbbbbbbbbbbbbbbb"
+        stored = (
+            "You are Hermes Agent.\n\n"
+            f"CHAT MEMORY [target: {chat_a}] [0% — 0/4,200 chars]\n"
+            f"Use the exact target `{chat_a}` when modifying this memory.\n\n"
+            "Conversation started: Tuesday, July 28, 2026\n"
+            "Session ID: test-session-id\n"
+            "Model: test-model\n"
+            "Provider: openrouter\n"
+            "Platform: signal"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+        agent.platform = "signal"
+        # This runtime-only value represents the physical chat now carrying the
+        # session. It is deliberately irrelevant to the restored frozen prompt.
+        agent._chat_memory_target = chat_b
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "resumed in B"}]
+        )
+
+        assert agent._cached_system_prompt == stored
+        assert chat_a in agent._cached_system_prompt
+        assert chat_b not in agent._cached_system_prompt
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+
     def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
         """Stored prompts are cache gold unless their runtime identity is stale.
 

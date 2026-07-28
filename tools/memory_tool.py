@@ -2,13 +2,14 @@
 """
 Memory Tool Module - Persistent Curated Memory
 
-Provides bounded, file-backed memory that persists across sessions. Two stores:
+Provides bounded, file-backed memory that persists across sessions. Three store classes:
   - MEMORY.md: agent's personal notes and observations (environment facts, project
     conventions, tool quirks, things learned)
   - USER.md: what the agent knows about the user (preferences, communication style,
     expectations, workflow habits)
+  - chat/<opaque-id>.md: durable facts scoped to one messaging chat
 
-Both are injected into the system prompt as a frozen snapshot at session start.
+All enabled/applicable stores are injected into the system prompt as a frozen snapshot at session start.
 Mid-session writes update files on disk immediately (durable) but do NOT change
 the system prompt -- this preserves the prefix cache for the entire session.
 The snapshot refreshes on the next session start.
@@ -23,9 +24,13 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import tempfile
 import time
 from contextlib import contextmanager
@@ -66,7 +71,117 @@ MEMORY_BLOCK_HEADERS = {
     "user": "USER PROFILE (who the user is)",
 }
 
+CHAT_MEMORY_BLOCK_HEADER = "CHAT MEMORY [target:"
+CHAT_TARGET_PATTERN = r"^chat-[0-9a-f]{16}$"
+MEMORY_TARGET_PATTERN = r"^(?:memory|user|chat-[0-9a-f]{16})$"
+CHAT_TARGET_RE = re.compile(CHAT_TARGET_PATTERN)
+_CHAT_TARGET_KEY_FILENAME = ".chat-target-key"
+
 ENTRY_DELIMITER = "\n§\n"
+
+
+def is_valid_chat_memory_target(target: Any) -> bool:
+    """Return whether *target* is a syntactically valid opaque CHAT address."""
+    return isinstance(target, str) and CHAT_TARGET_RE.fullmatch(target) is not None
+
+
+def is_valid_memory_target(target: Any) -> bool:
+    """Return whether *target* names a supported built-in memory store."""
+    return target in {"memory", "user"} or is_valid_chat_memory_target(target)
+
+
+def _load_or_create_chat_target_key() -> bytes:
+    """Load the profile-local key used to hide native routing identifiers.
+
+    The key is not a chat-target registry: no target or route mapping is stored.
+    It only makes deterministic target derivation opaque to the model provider,
+    especially for guessable DM identifiers such as phone numbers.
+    """
+    mem_dir = get_memory_dir()
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    key_path = mem_dir / _CHAT_TARGET_KEY_FILENAME
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+
+    # O_EXCL makes one creator authoritative. Other concurrent agents may see
+    # the file before its contents have been flushed, so retry that short
+    # in-flight window without recursively replacing or regenerating the key.
+    for attempt in range(21):
+        try:
+            raw = key_path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            key = secrets.token_bytes(32)
+            encoded = key.hex() + "\n"
+            try:
+                fd = os.open(key_path, flags, 0o600)
+            except FileExistsError:
+                if attempt < 20:
+                    time.sleep(0.005)
+                    continue
+                raise RuntimeError(f"CHAT target key creation race at {key_path}")
+            try:
+                with os.fdopen(fd, "w", encoding="ascii") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                try:
+                    key_path.unlink()
+                except OSError:
+                    pass
+                raise
+            return key
+
+        if raw:
+            try:
+                key = bytes.fromhex(raw)
+            except ValueError as exc:
+                if attempt < 20:
+                    time.sleep(0.005)
+                    continue
+                raise RuntimeError(f"Invalid CHAT target key at {key_path}") from exc
+            if len(key) == 32:
+                try:
+                    os.chmod(key_path, 0o600)
+                except OSError:
+                    pass
+                return key
+            if attempt >= 20:
+                raise RuntimeError(f"Invalid CHAT target key length at {key_path}")
+        elif attempt >= 20:
+            # A creator that crashed after O_EXCL can leave a zero-length file.
+            # Fail closed rather than silently changing every existing target.
+            raise RuntimeError(f"Empty CHAT target key at {key_path}")
+
+        time.sleep(0.005)
+
+    raise RuntimeError(f"Unable to load CHAT target key at {key_path}")
+
+
+def derive_chat_memory_target(
+    platform: Any,
+    chat_id: Any,
+    thread_id: Any = None,
+) -> Optional[str]:
+    """Derive an opaque, stable CHAT target from a native messaging route.
+
+    Display names are deliberately absent: renames retain continuity and
+    same-named or recreated chats remain isolated by their native identity.
+    Returns ``None`` when there is no usable messaging origin.
+    """
+    platform_text = str(platform or "").strip().lower()
+    chat_text = str(chat_id or "").strip()
+    if not platform_text or not chat_text:
+        return None
+    thread_text = str(thread_id or "").strip()
+    canonical = json.dumps(
+        ["hermes-chat-memory-v1", platform_text, chat_text, thread_text],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hmac.new(
+        _load_or_create_chat_target_key(), canonical, hashlib.sha256
+    ).hexdigest()[:16]
+    return f"chat-{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +269,8 @@ class MemoryStore:
     Maintains two parallel states:
       - _system_prompt_snapshot: frozen at load time, used for system prompt injection.
         Never mutated mid-session. Keeps prefix cache stable.
-      - memory_entries / user_entries: live state, mutated by tool calls, persisted to disk.
-        Tool responses always reflect this live state.
+      - memory_entries / user_entries / chat_entries: live state, mutated by tool calls,
+        persisted to disk. Tool responses always reflect this live state.
     """
 
     # After this many failed consolidation attempts (overflow / zero-match) in
@@ -164,11 +279,18 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        chat_target: Optional[str] = None,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
+        self.chat_entries: Dict[str, List[str]] = {}
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.chat_target = chat_target if is_valid_chat_memory_target(chat_target) else None
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
@@ -203,7 +325,7 @@ class MemoryStore:
         }
 
     def load_from_disk(self):
-        """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
+        """Load built-in stores and capture the frozen system-prompt snapshot.
 
         The frozen snapshot is what enters the system prompt. We scan each
         entry for injection/promptware patterns at snapshot-build time —
@@ -212,9 +334,9 @@ class MemoryStore:
         chain, compromised tool, sister-session write) cannot inject into
         the system prompt.
 
-        The live ``memory_entries`` / ``user_entries`` lists keep the
-        original text so the user can still SEE poisoned entries via
-        see poisoned entries by inspecting the source files directly, and remove them — silently dropping them would hide the attack from the user.
+        The live ``memory_entries`` / ``user_entries`` / ``chat_entries``
+        collections keep the original text so the user can still inspect and
+        remove poisoned entries; silently dropping them would hide the attack.
 
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
@@ -229,17 +351,34 @@ class MemoryStore:
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
 
-        # Sanitize entries for the system-prompt snapshot only.  Live state
-        # (memory_entries / user_entries) keeps the raw text so the user
-        # can see + remove poisoned entries via the memory tool.
+        chat_entries: List[str] = []
+        if self.chat_target:
+            chat_entries = list(
+                dict.fromkeys(self._read_file(self._path_for(self.chat_target)))
+            )
+            self.chat_entries[self.chat_target] = chat_entries
+
+        # Sanitize entries for the system-prompt snapshot only. Live state keeps
+        # raw text so the user can inspect + remove poisoned entries.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
+        sanitized_chat = (
+            self._sanitize_entries_for_snapshot(chat_entries, f"{self.chat_target}.md")
+            if self.chat_target
+            else []
+        )
 
-        # Capture frozen snapshot for system prompt injection
+        # Capture frozen snapshot for system prompt injection.
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
         }
+        if self.chat_target:
+            # Render even an empty CHAT store so the first durable fact has an
+            # explicit opaque address without eagerly creating the .md file.
+            self._system_prompt_snapshot[self.chat_target] = self._render_block(
+                self.chat_target, sanitized_chat
+            )
 
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
@@ -319,7 +458,13 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
-        return mem_dir / "MEMORY.md"
+        if target == "memory":
+            return mem_dir / "MEMORY.md"
+        if is_valid_chat_memory_target(target):
+            # The validated suffix contains only lowercase hex characters, so
+            # it cannot escape the flat CHAT directory.
+            return mem_dir / "chat" / f"{target[5:]}.md"
+        raise ValueError(f"Invalid memory target: {target!r}")
 
     def _reload_target(self, target: str, *, skip_drift: bool = False):
         """Re-read entries from disk into in-memory state.
@@ -370,13 +515,21 @@ class MemoryStore:
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
             return self.user_entries
-        return self.memory_entries
+        if target == "memory":
+            return self.memory_entries
+        if is_valid_chat_memory_target(target):
+            return self.chat_entries.setdefault(target, [])
+        raise ValueError(f"Invalid memory target: {target!r}")
 
     def _set_entries(self, target: str, entries: List[str]):
         if target == "user":
             self.user_entries = entries
-        else:
+        elif target == "memory":
             self.memory_entries = entries
+        elif is_valid_chat_memory_target(target):
+            self.chat_entries[target] = entries
+        else:
+            raise ValueError(f"Invalid memory target: {target!r}")
 
     def _char_count(self, target: str) -> int:
         entries = self._entries_for(target)
@@ -387,6 +540,8 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         if target == "user":
             return self.user_char_limit
+        if target != "memory" and not is_valid_chat_memory_target(target):
+            raise ValueError(f"Invalid memory target: {target!r}")
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
@@ -732,7 +887,8 @@ class MemoryStore:
 
     def _render_block(self, target: str, entries: List[str]) -> str:
         """Render a system prompt block with header and usage indicator."""
-        if not entries:
+        is_chat = is_valid_chat_memory_target(target)
+        if not entries and not is_chat:
             return ""
 
         limit = self._char_limit(target)
@@ -740,13 +896,28 @@ class MemoryStore:
         current = len(content)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
+        guidance = ""
         if target == "user":
             header = f"{MEMORY_BLOCK_HEADERS['user']} [{pct}% — {current:,}/{limit:,} chars]"
-        else:
+        elif target == "memory":
             header = f"{MEMORY_BLOCK_HEADERS['memory']} [{pct}% — {current:,}/{limit:,} chars]"
+        elif is_chat:
+            header = f"CHAT MEMORY [target: {target}] [{pct}% — {current:,}/{limit:,} chars]"
+            guidance = (
+                f"Use the exact target `{target}` when modifying this CHAT memory. "
+                "Another valid `chat-<ID>` may be used only when the task explicitly "
+                "requires addressing a different chat."
+            )
+        else:
+            raise ValueError(f"Invalid memory target: {target!r}")
 
         separator = "═" * 46
-        return f"{separator}\n{header}\n{separator}\n{content}"
+        parts = [separator, header, separator]
+        if guidance:
+            parts.append(guidance)
+        if content:
+            parts.append(content)
+        return "\n".join(parts)
 
     @staticmethod
     def _read_raw_checked(path: Path) -> Tuple[str, bool]:
@@ -945,7 +1116,13 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         return None
 
     # Build a small inline summary/detail for the foreground approval prompt.
-    label = "user profile" if target == "user" else "memory"
+    label = (
+        "user profile"
+        if target == "user"
+        else "CHAT memory"
+        if is_valid_chat_memory_target(target)
+        else "memory"
+    )
     if action == "add":
         summary = f"add to {label}"
         detail = content or ""
@@ -995,7 +1172,13 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     except Exception:
         return None
 
-    label = "user profile" if target == "user" else "memory"
+    label = (
+        "user profile"
+        if target == "user"
+        else "CHAT memory"
+        if is_valid_chat_memory_target(target)
+        else "memory"
+    )
     summary = f"apply {len(operations)} op(s) to {label}"
     detail_lines = []
     for op in operations:
@@ -1089,8 +1272,12 @@ def memory_tool(
     if target is None:
         target = "memory"
 
-    if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if not is_valid_memory_target(target):
+        return tool_error(
+            f"Invalid target '{target}'. Use 'memory', 'user', or a valid "
+            "opaque target matching 'chat-<16 lowercase hex characters>'.",
+            success=False,
+        )
 
     # --- Batch path -------------------------------------------------------
     if operations:
@@ -1153,6 +1340,8 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     """
     action = payload.get("action")
     target = payload.get("target", "memory")
+    if not is_valid_memory_target(target):
+        return {"success": False, "error": f"Invalid staged memory target '{target}'."}
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "batch":
@@ -1186,7 +1375,10 @@ MEMORY_SCHEMA = {
         "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
         "removes or shortens enough stale entries and adds the new one together.\n\n"
         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-        "notes (environment, conventions, tool quirks, lessons).\n\n"
+        "global notes (environment, conventions, tool quirks, lessons). 'chat-<ID>' = durable "
+        "memory for the addressed chat. When a CHAT MEMORY block is present, use the exact "
+        "target printed in that block for facts belonging to that chat. Another valid "
+        "chat-<ID> may be used only when the task explicitly requires a different chat.\n\n"
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
         "completed-work logs, temporary TODO state (use session_search for those). Reusable "
         "procedures belong in a skill, not memory."
@@ -1201,8 +1393,12 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "pattern": MEMORY_TARGET_PATTERN,
+                "description": (
+                    "Which memory store: 'memory' for global notes, 'user' for the user "
+                    "profile, or a valid opaque 'chat-<ID>' target. Use the exact CHAT "
+                    "target printed in the applicable CHAT MEMORY system-prompt block."
+                )
             },
             "content": {
                 "type": "string",

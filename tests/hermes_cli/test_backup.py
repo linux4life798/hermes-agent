@@ -857,6 +857,7 @@ class TestImport:
             ".env": "OPENROUTER_API_KEY=sk-secret\n",
             "auth.json": '{"providers": {"nous": "token"}}',
             "state.db": b"SQLite format 3\x00",
+            "memories/.chat-target-key": "11" * 32 + "\n",
             "profiles/coder/.env": "ANTHROPIC_API_KEY=sk-ant-secret\n",
         })
 
@@ -865,7 +866,13 @@ class TestImport:
         from hermes_cli.backup import run_import
         run_import(args)
 
-        for rel in (".env", "auth.json", "state.db", "profiles/coder/.env"):
+        for rel in (
+            ".env",
+            "auth.json",
+            "state.db",
+            "memories/.chat-target-key",
+            "profiles/coder/.env",
+        ):
             mode = (hermes_home / rel).stat().st_mode & 0o777
             assert mode == 0o600, f"{rel} restored with mode {oct(mode)}, expected 0o600"
 

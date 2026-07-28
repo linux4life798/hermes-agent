@@ -20,7 +20,7 @@ Run `hermes setup --portal` — one OAuth gets you a model provider and all four
 ├── .env            # API keys and secrets
 ├── auth.json       # OAuth provider credentials (Nous Portal, etc.)
 ├── SOUL.md         # Primary agent identity (slot #1 in system prompt)
-├── memories/       # Persistent memory (MEMORY.md, USER.md)
+├── memories/       # Persistent memory (MEMORY.md, USER.md, chat/<opaque-id>.md)
 ├── skills/         # Agent-created skills (managed via skill_manage tool)
 ├── cron/           # Scheduled jobs
 ├── sessions/       # Gateway sessions

@@ -249,7 +249,7 @@ def cmd_setup(args) -> None:
     items = []
     for name, desc, _ in providers:
         items.append((name, f"— {desc}"))
-    items.append(("Built-in only", "— MEMORY.md / USER.md (default)"))
+    items.append(("Built-in only", "— MEMORY.md / USER.md / CHAT (default)"))
 
     builtin_idx = len(items) - 1
     selected = _curses_select("Memory provider setup", items, default=builtin_idx, cancel_returns=_CANCELLED)
@@ -451,9 +451,10 @@ def cmd_status(args) -> None:
     tool_mark = "enabled ✓" if memory_tool_enabled else "disabled ✗"
 
     print("\nMemory status\n" + "─" * 40)
-    print("  Built-in (MEMORY.md / USER.md):")
+    print("  Built-in (MEMORY.md / USER.md / CHAT):")
     print(f"    Memory injection:   {mem_mark}")
     print(f"    User profile:       {user_mark}")
+    print(f"    CHAT injection:     {mem_mark} (messaging/cron origins)")
     print(f"    Memory tool:        {tool_mark}")
     print(f"  Provider:  {provider_name or '(none — built-in only)'}")
 

@@ -2,7 +2,7 @@
 
 Covers:
 - Status output shows config-aware indicators instead of hardcoded 'always active'
-- memory_enabled, user_profile_enabled, and memory tool are each reflected
+- memory_enabled, CHAT enablement, user_profile_enabled, and memory tool are reflected
 - Memory tool resolution uses the canonical _get_platform_tools resolver
 - Original issue: 'Built-in: always active' was misleading when features were disabled
 """
@@ -57,6 +57,11 @@ class TestMemoryStatusLabels:
         assert "Memory injection:" in out
         assert "disabled ✗" in out
 
+    def test_chat_injection_follows_memory_enabled(self, capfd):
+        out = _run_cmd_status(capfd, mem_config={"memory_enabled": False})
+        assert "CHAT injection:" in out
+        assert "CHAT injection:     disabled ✗" in out
+
     def test_shows_user_profile_disabled(self, capfd):
         """When user_profile_enabled is false, status reflects it."""
         out = _run_cmd_status(
@@ -106,11 +111,11 @@ class TestMemoryStatusLabels:
         assert "Memory injection:" in out
 
     def test_all_disabled(self, capfd):
-        """All three indicators show disabled when everything is off."""
+        """All four indicators show disabled when everything is off."""
         out = _run_cmd_status(
             capfd,
             mem_config={"memory_enabled": False, "user_profile_enabled": False},
             memory_tools=set(),
         )
-        assert out.count("disabled ✗") == 3
+        assert out.count("disabled ✗") == 4
         assert "always active" not in out

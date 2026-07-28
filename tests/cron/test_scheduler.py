@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_chat_memory_target, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -111,7 +111,6 @@ class TestResolveOrigin:
     def test_empty_origin(self):
         job = {"origin": {}}
         assert _resolve_origin(job) is None
-
     @pytest.mark.parametrize(
         "non_dict_origin",
         [
@@ -134,6 +133,48 @@ class TestResolveOrigin:
         """
         job = {"origin": non_dict_origin}
         assert _resolve_origin(job) is None
+
+
+class TestResolveChatMemoryTarget:
+    def test_uses_origin_not_delivery_or_context_from(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+        base = {
+            "origin": {
+                "platform": "signal",
+                "chat_id": "group:origin-chat",
+                "thread_id": "topic-1",
+            }
+        }
+        expected = _resolve_chat_memory_target(base)
+
+        changed_routing = {
+            **base,
+            "deliver": "all",
+            "context_from": ["another-job"],
+        }
+        assert expected is not None
+        assert _resolve_chat_memory_target(changed_routing) == expected
+
+    def test_origin_thread_and_chat_are_isolated(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+        first = _resolve_chat_memory_target(
+            {"origin": {"platform": "signal", "chat_id": "group:a", "thread_id": "1"}}
+        )
+        other_thread = _resolve_chat_memory_target(
+            {"origin": {"platform": "signal", "chat_id": "group:a", "thread_id": "2"}}
+        )
+        other_chat = _resolve_chat_memory_target(
+            {"origin": {"platform": "signal", "chat_id": "group:b", "thread_id": "1"}}
+        )
+
+        assert first is not None
+        assert len({first, other_thread, other_chat}) == 3
+
+    def test_missing_messaging_origin_gets_no_chat_memory(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+        assert _resolve_chat_memory_target({}) is None
+        assert _resolve_chat_memory_target({"origin": "manual import"}) is None
+        assert _resolve_chat_memory_target({"origin": {"platform": "signal"}}) is None
 
 
 class TestResolveDeliveryTarget:

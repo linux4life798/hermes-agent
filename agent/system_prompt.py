@@ -507,6 +507,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
+        # A newly built messaging/cron prompt receives exactly one origin-scoped
+        # CHAT snapshot. Restored sessions bypass this builder and keep the CHAT
+        # block already frozen in their saved prompt.
+        if (
+            getattr(agent, "_chat_memory_enabled", False)
+            and getattr(agent, "_chat_memory_target", None)
+        ):
+            chat_block = agent._memory_store.format_for_system_prompt(
+                agent._chat_memory_target
+            )
+            if chat_block:
+                volatile_parts.append(chat_block)
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:
