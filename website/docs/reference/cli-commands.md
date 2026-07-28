@@ -1296,7 +1296,7 @@ See [Hooks](../user-guide/features/hooks.md) for event signatures and payload sh
 hermes memory <subcommand>
 ```
 
-Set up and manage external memory provider plugins. Available providers: honcho, openviking, mem0, hindsight, holographic, retaindb, byterover, supermemory. Only one external provider can be active at a time. Built-in memory (MEMORY.md/USER.md) is always active.
+Set up and manage external memory provider plugins. Available providers: honcho, openviking, mem0, hindsight, holographic, retaindb, byterover, supermemory. Only one external provider can be active at a time. Built-in global, user, and origin-scoped CHAT memory remain available.
 
 Subcommands:
 
@@ -1305,6 +1305,7 @@ Subcommands:
 | `setup` | Interactive provider selection and configuration. |
 | `status` | Show current memory provider config. |
 | `off` | Disable external provider (built-in only). |
+| `reset [--target all|memory|user|chat] [--yes]` | Delete selected built-in memory contents. CHAT reset preserves the private target-derivation key so stable addresses remain stable. |
 
 :::info Provider-specific subcommands
 When an external memory provider is active, it may register its own top-level `hermes <provider>` command for provider-specific management (e.g. `hermes honcho` when Honcho is active). Inactive providers do not expose their subcommands. Run `hermes --help` to see what's currently wired in.

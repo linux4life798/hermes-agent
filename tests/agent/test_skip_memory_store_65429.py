@@ -24,7 +24,7 @@ class _FakeOpenAI:
         pass
 
 
-def _make_agent(monkeypatch, enabled_toolsets=None, skip_memory=True):
+def _make_agent(monkeypatch, enabled_toolsets=None, skip_memory=True, **kwargs):
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
     monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
@@ -38,6 +38,7 @@ def _make_agent(monkeypatch, enabled_toolsets=None, skip_memory=True):
         skip_context_files=True,
         skip_memory=skip_memory,
         enabled_toolsets=enabled_toolsets,
+        **kwargs,
     )
 
 
@@ -63,6 +64,53 @@ def test_memory_toolset_without_skip_memory_creates_store(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
     agent = _make_agent(monkeypatch, enabled_toolsets=["memory"], skip_memory=False)
     assert agent._memory_store is not None
+
+
+def test_skip_memory_with_chat_origin_loads_only_chat_store(monkeypatch, tmp_path):
+    """Cron-style agents suppress global memory but still receive one CHAT block."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+    agent = _make_agent(
+        monkeypatch,
+        enabled_toolsets=None,
+        skip_memory=True,
+        platform="signal",
+        chat_id="group:cron-origin",
+    )
+
+    assert agent._memory_store is not None
+    assert agent._memory_enabled is False
+    assert agent._user_profile_enabled is False
+    assert agent._chat_memory_enabled is True
+    assert agent._chat_memory_target.startswith("chat-")
+
+    from agent.system_prompt import build_system_prompt_parts
+
+    volatile = build_system_prompt_parts(agent)["volatile"]
+    assert f"CHAT MEMORY [target: {agent._chat_memory_target}]" in volatile
+    assert "PERSISTENT MEMORY (your personal notes)" not in volatile
+    assert "USER PROFILE (who the user is)" not in volatile
+
+
+def test_invalid_chat_key_does_not_disable_global_memory(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hm"
+    mem_dir = hermes_home / "memories"
+    mem_dir.mkdir(parents=True)
+    (mem_dir / "MEMORY.md").write_text("Global fact survives.", encoding="utf-8")
+    (mem_dir / ".chat-target-key").write_text("not-hex\n", encoding="ascii")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    agent = _make_agent(
+        monkeypatch,
+        enabled_toolsets=["memory"],
+        skip_memory=False,
+        platform="signal",
+        chat_id="group:corrupt-key",
+    )
+
+    assert agent._memory_store is not None
+    assert "Global fact survives." in agent._memory_store.memory_entries
+    assert agent._chat_memory_enabled is False
+    assert agent._chat_memory_target is None
 
 
 def test_skip_memory_memory_tool_handler_works_and_provider_skipped(

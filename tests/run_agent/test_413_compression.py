@@ -677,6 +677,49 @@ class TestPreflightCompression:
         build_prompt.assert_not_called()
         memory_store.load_from_disk.assert_called_once()
 
+    def test_compression_preserves_frozen_chat_prompt_without_comparing_chat_file(
+        self, agent
+    ):
+        """CHAT drift must not rebuild a resumed prompt or substitute its route."""
+        agent.compression_enabled = False
+        agent._memory_enabled = False
+        agent._user_profile_enabled = False
+        agent._chat_memory_enabled = True
+        agent._chat_memory_target = "chat-bbbbbbbbbbbbbbbb"
+        agent._memory_manager = None
+        agent._cached_system_prompt = (
+            "cached system prompt\n\n"
+            "CHAT MEMORY [target: chat-aaaaaaaaaaaaaaaa] [1% — 10/4,200 chars]\n"
+            "fact from A"
+        )
+        memory_store = MagicMock()
+        agent._memory_store = memory_store
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                return_value=[
+                    {
+                        "role": "user",
+                        "content": f"{SUMMARY_PREFIX}\nPrevious conversation",
+                    }
+                ],
+            ),
+            patch.object(agent, "_build_system_prompt") as build_prompt,
+        ):
+            _, new_system_prompt = agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+
+        assert new_system_prompt is agent._cached_system_prompt
+        assert "chat-aaaaaaaaaaaaaaaa" in new_system_prompt
+        assert "chat-bbbbbbbbbbbbbbbb" not in new_system_prompt
+        build_prompt.assert_not_called()
+        memory_store.load_from_disk.assert_called_once()
+
     def test_compression_rebuilds_prompt_when_memory_snapshot_changes(self, agent):
         """A changed memory block must be reflected in the next model request."""
         agent.compression_enabled = False

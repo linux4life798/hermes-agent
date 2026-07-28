@@ -503,6 +503,7 @@ def init_agent(
     chat_name: str = None,
     chat_type: str = None,
     thread_id: str = None,
+    chat_memory_target: Optional[str] = None,
     gateway_session_key: str = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
@@ -590,6 +591,11 @@ def init_agent(
     agent._chat_name = chat_name
     agent._chat_type = chat_type
     agent._thread_id = thread_id
+    # Runtime-only default used when building a NEW system prompt. It is
+    # deliberately not persisted in session metadata: a resumed session's
+    # frozen saved prompt remains authoritative for which CHAT target the model
+    # sees and uses.
+    agent._chat_memory_target = chat_memory_target
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
@@ -1602,31 +1608,69 @@ def init_agent(
     # broad pseudo-public config object on the agent instance.
     agent._aux_compression_context_length_config = None
 
-    # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+    # Persistent memory (MEMORY.md + USER.md + optional CHAT) -- loaded from disk
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
+    agent._chat_memory_enabled = False
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    # A flush/background agent may pass skip_memory=True to avoid spinning up an
-    # external memory *provider*, but if the caller also explicitly enables the
-    # "memory" toolset it still needs the built-in file-backed store — otherwise
-    # the memory tool dispatches with store=None and every call fails (#65429).
-    # So the built-in store is created unless memory is globally disabled, while
-    # the external-provider block below stays gated on skip_memory.
+    # A flush/background agent may pass skip_memory=True to avoid global MEMORY
+    # and USER injection, but an origin-scoped CHAT snapshot or an explicitly
+    # enabled memory toolset still requires the built-in file-backed store.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    _has_chat_origin = bool(agent._chat_memory_target or (platform and chat_id))
+    if not skip_memory or _memory_toolset_requested or _has_chat_origin:
         try:
             mem_config = _agent_cfg.get("memory", {})
-            agent._memory_enabled = mem_config.get("memory_enabled", False)
-            agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            _configured_memory_enabled = mem_config.get("memory_enabled", False)
+            _configured_user_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-            if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
+
+            # Global MEMORY/USER remain suppressed for skip_memory agents such as
+            # cron. CHAT is separately safe because only the job origin's one
+            # scoped file is selected and injected.
+            if not skip_memory:
+                agent._memory_enabled = _configured_memory_enabled
+                agent._user_profile_enabled = _configured_user_enabled
+
+            from tools.memory_tool import (
+                MemoryStore,
+                derive_chat_memory_target,
+                is_valid_chat_memory_target,
+            )
+
+            if not is_valid_chat_memory_target(agent._chat_memory_target):
+                try:
+                    agent._chat_memory_target = derive_chat_memory_target(
+                        platform, chat_id, thread_id
+                    )
+                except Exception as _chat_memory_err:
+                    # A missing/corrupt CHAT key must not take global MEMORY or
+                    # USER offline. Fail only the scoped store closed.
+                    _ra().logger.warning(
+                        "CHAT memory target derivation disabled: %s",
+                        _chat_memory_err,
+                    )
+                    agent._chat_memory_target = None
+            agent._chat_memory_enabled = bool(
+                _configured_memory_enabled
+                and is_valid_chat_memory_target(agent._chat_memory_target)
+            )
+
+            if (
+                agent._memory_enabled
+                or agent._user_profile_enabled
+                or agent._chat_memory_enabled
+                or _memory_toolset_requested
+            ):
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    chat_target=(
+                        agent._chat_memory_target if agent._chat_memory_enabled else None
+                    ),
                 )
                 agent._memory_store.load_from_disk()
         except Exception:

@@ -5,7 +5,7 @@ Background
 ----------
 The agent writes to two persistent stores that survive across sessions:
 
-  * **memory** — MEMORY.md / USER.md, small (~200 char) declarative entries
+  * **memory** — MEMORY.md / USER.md / scoped CHAT files, small declarative entries
   * **skills** — SKILL.md + supporting files, potentially huge (10-100 KB)
 
 Both stores are written from two origins:

@@ -19,7 +19,7 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
             "Available providers: honcho, openviking, mem0, hindsight,\n"
             "holographic, retaindb, byterover.\n\n"
             "Only one external provider can be active at a time.\n"
-            "Built-in memory (MEMORY.md/USER.md) is always active."
+            "Built-in memory (MEMORY.md/USER.md and scoped CHAT files) is always active."
         ),
     )
     memory_sub = memory_parser.add_subparsers(dest="memory_command")
@@ -36,7 +36,7 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
     _reset_parser = memory_sub.add_parser(
         "reset",
-        help="Erase all built-in memory (MEMORY.md and USER.md)",
+        help="Erase built-in global, user, and/or CHAT memory",
     )
     _reset_parser.add_argument(
         "--yes",
@@ -46,8 +46,8 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
     )
     _reset_parser.add_argument(
         "--target",
-        choices=["all", "memory", "user"],
+        choices=["all", "memory", "user", "chat"],
         default="all",
-        help="Which store to reset: 'all' (default), 'memory', or 'user'",
+        help="Which store to reset: 'all' (default), 'memory', 'user', or 'chat'",
     )
     memory_parser.set_defaults(func=cmd_memory)

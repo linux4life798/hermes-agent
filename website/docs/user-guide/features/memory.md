@@ -1,7 +1,7 @@
 ---
 sidebar_position: 3
 title: "Persistent Memory"
-description: "How Hermes Agent remembers across sessions — MEMORY.md, USER.md, and session search"
+description: "How Hermes Agent remembers across sessions — global, user, and CHAT memory"
 ---
 
 # Persistent Memory
@@ -10,14 +10,18 @@ Hermes Agent has bounded, curated memory that persists across sessions. This let
 
 ## How It Works
 
-Two files make up the agent's memory:
+Hermes has two global stores plus one optional chat-scoped store:
 
 | File | Purpose | Char Limit |
 |------|---------|------------|
 | **MEMORY.md** | Agent's personal notes — environment facts, conventions, things learned | 2,200 chars (~800 tokens) |
 | **USER.md** | User profile — your preferences, communication style, expectations | 1,375 chars (~500 tokens) |
+| **chat/&lt;opaque-id&gt;.md** | Durable facts for one messaging chat or platform thread | Same limit as MEMORY.md |
 
-Both are stored in `~/.hermes/memories/` and are injected into the system prompt as a frozen snapshot at session start. The agent manages its own memory via the `memory` tool — it can add, replace, or remove entries.
+The files live under `~/.hermes/memories/`. A new messaging session receives
+the global stores plus exactly one applicable CHAT block. CHAT filenames and
+model-visible targets are opaque; native provider chat IDs are not placed in
+the prompt. The agent manages every store through the same `memory` tool.
 
 :::info
 Character limits keep memory focused. Memory does **not** auto-compact: when a
@@ -45,12 +49,38 @@ User prefers concise responses, dislikes verbose explanations
 ```
 
 The format includes:
-- A header showing which store (MEMORY or USER PROFILE)
+- A header showing which store (MEMORY, USER PROFILE, or CHAT MEMORY)
 - Usage percentage and character counts so the agent knows capacity
 - Individual entries separated by `§` (section sign) delimiters
 - Entries can be multiline
 
-**Frozen snapshot pattern:** The system prompt injection is captured once at session start and never changes mid-session. This is intentional — it preserves the LLM's prefix cache for performance. When the agent adds/removes memory entries during a session, the changes are persisted to disk immediately but won't appear in the system prompt until the next session starts. Tool responses always show the live state.
+**Frozen snapshot pattern:** The system prompt injection is captured once at
+session start and does not change after ordinary writes. This preserves the
+LLM's prefix cache. If session A is resumed through physical chat B, Hermes
+restores A's saved prompt verbatim, including A's frozen CHAT block and target.
+A fresh session created in B instead receives B's CHAT block. CHAT-file drift
+does not itself force compression to rebuild a saved prompt.
+`/branch` copies the parent's saved prompt opaquely, so a branch also preserves
+the parent's frozen CHAT block without parsing its target.
+
+An empty new chat still receives a zero-usage CHAT header containing its opaque
+target, but no `.md` content file is created until the first durable write.
+
+### CHAT target format and privacy
+
+The tool accepts `memory`, `user`, or a validated target matching
+`chat-[0-9a-f]{16}`. Tool guidance is static; the exact applicable target is
+printed in the CHAT block:
+
+```
+CHAT MEMORY [target: chat-0123456789abcdef] [0% — 0/2,200 chars]
+Use the exact target `chat-0123456789abcdef` when modifying this memory.
+```
+
+Hermes automatically injects only the applicable CHAT file. Merely accepting
+other valid CHAT addresses does not inject their contents. Explicitly operating
+on another target can expose that operation or its returned state to the model
+provider, so automatic selection remains deliberately narrow.
 
 ## Memory Tool Actions
 
@@ -75,7 +105,7 @@ memory(action="replace", target="memory",
 
 If the substring matches multiple entries, an error is returned asking for a more specific match.
 
-## Two Targets Explained
+## Targets Explained
 
 ### `memory` — Agent's Personal Notes
 
@@ -96,6 +126,19 @@ For information about the user's identity, preferences, and communication style:
 - Pet peeves and things to avoid
 - Workflow habits
 - Technical skill level
+
+### `chat-<ID>` — One Chat's Durable Context
+
+For facts that should follow one group, DM, channel, or platform thread rather
+than every conversation:
+
+- Purpose and standing decisions
+- Members and their roles
+- Chat-specific timezone or calendar defaults
+- Preferences and explicit “remember this here” facts
+
+Display names are never storage keys. Renaming a chat preserves continuity;
+different or recreated same-named chats receive different opaque targets.
 
 ## What to Save vs Skip
 
@@ -126,6 +169,7 @@ Memory has strict character limits to keep system prompts bounded:
 |-------|-------|----------------|
 | memory | 2,200 chars | 8-15 entries |
 | user | 1,375 chars | 5-10 entries |
+| chat-<ID> | memory_char_limit | Varies by chat |
 
 ### What Happens When Memory is Full
 
@@ -231,7 +275,7 @@ The same `list` / `delete <id>` / `edit <id>` subcommands work from the in-chat 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2200   # ~800 tokens
+  memory_char_limit: 2200   # global MEMORY and each CHAT store
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
 ```
@@ -249,6 +293,9 @@ first, set `memory.write_approval: true`. It's a simple on/off gate applied to
 | `true` | Require approval before anything is saved. In the interactive CLI, foreground writes prompt you inline (entries are small enough to read in full). Everywhere else — messaging platforms, scripts, and the background self-improvement review — writes are **staged** for review with `/memory pending`. |
 
 > To turn memory off entirely (not just gate it), set `memory_enabled: false`.
+
+CHAT uses `memory_enabled` and `memory_char_limit`; there is no separate CHAT
+registry or per-session persisted target setting.
 
 Review staged writes from the CLI or any messaging platform:
 

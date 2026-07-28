@@ -19,7 +19,7 @@ backends reject.
 
 import json
 
-from tools.memory_tool import MEMORY_SCHEMA
+from tools.memory_tool import MEMORY_SCHEMA, MEMORY_TARGET_PATTERN
 
 
 _FORBIDDEN_TOP_LEVEL_KEYS = ("allOf", "anyOf", "oneOf", "enum", "not")
@@ -42,9 +42,13 @@ def test_memory_schema_is_well_formed():
     # Only ``target`` is universally required: ``action`` belongs to the
     # single-op shape and is omitted when the batch ``operations`` array is used.
     assert params["required"] == ["target"]
-    # Nested ``enum`` on property values is fine — only top-level is forbidden.
+    # Nested action enums are fine — only top-level combinators are forbidden.
     assert params["properties"]["action"]["enum"] == ["add", "replace", "remove"]
-    assert params["properties"]["target"]["enum"] == ["memory", "user"]
+    # Target is runtime-validated because CHAT accepts any syntactically valid
+    # opaque chat-<ID>; a fixed enum would force per-session schema mutation.
+    assert "enum" not in params["properties"]["target"]
+    assert params["properties"]["target"]["pattern"] == MEMORY_TARGET_PATTERN
+    assert "chat-<ID>" in params["properties"]["target"]["description"]
     # Batch shape is exposed and its items reuse the same actions.
     assert params["properties"]["operations"]["type"] == "array"
     assert params["properties"]["operations"]["items"]["properties"]["action"]["enum"] == ["add", "replace", "remove"]

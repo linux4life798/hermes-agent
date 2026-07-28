@@ -15801,6 +15801,154 @@ def _try_termux_fast_tui_launch() -> bool:
     return True
 
 
+_CHAT_MEMORY_RESET_NAME_RE = re.compile(r"^[0-9a-f]{16}\.md$")
+
+
+def _open_chat_memory_reset_dir(chat_dir: Path) -> tuple[int | None, list[tuple[str, int]]]:
+    """Open a real CHAT directory without following symlinks.
+
+    The returned descriptor stays open from enumeration through deletion so a
+    path swap cannot redirect reset outside the selected profile. Only flat,
+    valid CHAT content filenames are returned; lock files and unrelated files
+    are deliberately preserved.
+    """
+    try:
+        before = os.lstat(chat_dir)
+    except FileNotFoundError:
+        return None, []
+
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise RuntimeError(
+            f"Refusing CHAT reset because {chat_dir} is not a real directory"
+        )
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(chat_dir, flags)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Refusing CHAT reset because {chat_dir} could not be opened safely"
+        ) from exc
+
+    try:
+        opened = os.fstat(directory_fd)
+        after = os.lstat(chat_dir)
+        expected = (before.st_dev, before.st_ino)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(after.st_mode)
+            or (opened.st_dev, opened.st_ino) != expected
+            or (after.st_dev, after.st_ino) != expected
+        ):
+            raise RuntimeError(
+                f"Refusing CHAT reset because {chat_dir} changed while opening"
+            )
+
+        entries: list[tuple[str, int]] = []
+        for name in os.listdir(directory_fd):
+            if not _CHAT_MEMORY_RESET_NAME_RE.fullmatch(name):
+                continue
+            try:
+                entry_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                entries.append((name, entry_stat.st_size))
+        return directory_fd, sorted(entries)
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def _cmd_memory_reset(args):
+    """Reset selected built-in memory stores with CHAT path/lock safety."""
+    from contextlib import ExitStack
+
+    from hermes_constants import get_hermes_home, display_hermes_home
+    from tools.memory_tool import MemoryStore
+
+    mem_dir = get_hermes_home() / "memories"
+    target = getattr(args, "target", "all")
+    files_to_reset = []
+    if target in {"all", "memory"}:
+        files_to_reset.append((mem_dir / "MEMORY.md", "agent notes"))
+    if target in {"all", "user"}:
+        files_to_reset.append((mem_dir / "USER.md", "user profile"))
+
+    chat_dir = mem_dir / "chat"
+    chat_fd = None
+    chat_entries: list[tuple[str, int]] = []
+    try:
+        if target in {"all", "chat"}:
+            try:
+                chat_fd, chat_entries = _open_chat_memory_reset_dir(chat_dir)
+            except RuntimeError as exc:
+                print(f"\n  ✗ {exc}\n")
+                return "refused"
+
+        existing = [
+            (path, desc)
+            for path, desc in files_to_reset
+            if os.path.lexists(path)
+        ]
+        if not existing and not chat_entries:
+            print(
+                f"\n  Nothing to reset — no memory files found in {display_hermes_home()}/memories/\n"
+            )
+            return "nothing"
+
+        print("\n  This will permanently erase the following memory files:")
+        for path, desc in existing:
+            size = path.lstat().st_size
+            print(f"    ◆ {path.relative_to(mem_dir)} ({desc}) — {size:,} bytes")
+        for name, size in chat_entries:
+            print(f"    ◆ chat/{name} (CHAT memory) — {size:,} bytes")
+
+        if not getattr(args, "yes", False):
+            try:
+                answer = input("\n  Type 'yes' to confirm: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Cancelled.\n")
+                return "cancelled"
+            if answer != "yes":
+                print("  Cancelled.\n")
+                return "cancelled"
+
+        lock_paths = [path for path, _desc in existing]
+        lock_paths.extend(chat_dir / name for name, _size in chat_entries)
+        with ExitStack() as locks:
+            for path in sorted(lock_paths, key=str):
+                locks.enter_context(MemoryStore._file_lock(path))
+
+            for path, desc in existing:
+                relative = path.relative_to(mem_dir)
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                print(f"  ✓ Deleted {relative} ({desc})")
+
+            if chat_fd is not None:
+                for name, _size in chat_entries:
+                    try:
+                        os.unlink(name, dir_fd=chat_fd)
+                    except FileNotFoundError:
+                        continue
+                    print(f"  ✓ Deleted chat/{name} (CHAT memory)")
+
+        print(
+            "\n  Memory reset complete. New sessions will start with a blank slate."
+        )
+        print(f"  Files were in: {display_hermes_home()}/memories/\n")
+        return "deleted"
+    finally:
+        if chat_fd is not None:
+            os.close(chat_fd)
+
+
 def cmd_memory(args):
     sub = getattr(args, "memory_command", None)
     if sub == "off":
@@ -15814,50 +15962,7 @@ def cmd_memory(args):
         print("\n  ✓ Memory provider: built-in only")
         print("  Saved to config.yaml\n")
     elif sub == "reset":
-        from hermes_constants import get_hermes_home, display_hermes_home
-
-        mem_dir = get_hermes_home() / "memories"
-        target = getattr(args, "target", "all")
-        files_to_reset = []
-        if target in {"all", "memory"}:
-            files_to_reset.append(("MEMORY.md", "agent notes"))
-        if target in {"all", "user"}:
-            files_to_reset.append(("USER.md", "user profile"))
-
-        # Check what exists
-        existing = [
-            (f, desc) for f, desc in files_to_reset if (mem_dir / f).exists()
-        ]
-        if not existing:
-            print(
-                f"\n  Nothing to reset — no memory files found in {display_hermes_home()}/memories/\n"
-            )
-            return
-
-        print("\n  This will permanently erase the following memory files:")
-        for f, desc in existing:
-            path = mem_dir / f
-            size = path.stat().st_size
-            print(f"    ◆ {f} ({desc}) — {size:,} bytes")
-
-        if not getattr(args, "yes", False):
-            try:
-                answer = input("\n  Type 'yes' to confirm: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("\n  Cancelled.\n")
-                return
-            if answer != "yes":
-                print("  Cancelled.\n")
-                return
-
-        for f, desc in existing:
-            (mem_dir / f).unlink()
-            print(f"  ✓ Deleted {f} ({desc})")
-
-        print(
-            "\n  Memory reset complete. New sessions will start with a blank slate."
-        )
-        print(f"  Files were in: {display_hermes_home()}/memories/\n")
+        _cmd_memory_reset(args)
     else:
         from hermes_cli.memory_setup import memory_command
 

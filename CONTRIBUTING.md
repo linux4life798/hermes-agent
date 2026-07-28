@@ -288,7 +288,7 @@ hermes-agent/
 | `~/.hermes/.env` | API keys and secrets |
 | `~/.hermes/auth.json` | OAuth credentials (Nous Portal) |
 | `~/.hermes/skills/` | All active skills (bundled + hub-installed + agent-created) |
-| `~/.hermes/memories/` | Persistent memory (MEMORY.md, USER.md) |
+| `~/.hermes/memories/` | Persistent memory (MEMORY.md, USER.md, scoped CHAT files) |
 | `~/.hermes/state.db` | SQLite session database |
 | `~/.hermes/sessions/` | Gateway routing index (`sessions.json`), request-dump breadcrumbs, gateway `*.jsonl` transcripts, and (optionally) per-session JSON snapshots when `sessions.write_json_snapshots: true` is set. The per-session snapshots are off by default; state.db is canonical. |
 | `~/.hermes/cron/` | Scheduled job data |

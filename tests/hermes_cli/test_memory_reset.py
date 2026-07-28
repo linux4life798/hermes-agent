@@ -1,12 +1,16 @@
 """Tests for the `hermes memory reset` CLI command.
 
 Covers:
-- Reset both stores (MEMORY.md + USER.md)
-- Reset individual stores (--target memory / --target user)
+- Reset all stores (MEMORY.md + USER.md + CHAT files)
+- Reset individual stores (--target memory / --target user / --target chat)
+- Preserve the private CHAT target-derivation key across content resets
 - Skip confirmation with --yes
 - Graceful handling when no memory files exist
 - Profile-scoped reset (uses HERMES_HOME)
 """
+
+from types import SimpleNamespace
+from unittest.mock import patch as mock_patch
 
 import pytest
 
@@ -28,42 +32,28 @@ def memory_env(tmp_path, monkeypatch):
         "§\nUser is Teknium\n§\nTimezone: US Pacific",
         encoding="utf-8",
     )
+    chat_dir = memories / "chat"
+    chat_dir.mkdir()
+    (chat_dir / "1111111111111111.md").write_text("Chat one", encoding="utf-8")
+    (chat_dir / "2222222222222222.md").write_text("Chat two", encoding="utf-8")
+    (memories / ".chat-target-key").write_text("11" * 32 + "\n", encoding="ascii")
     return hermes_home, memories
 
 
 def _run_memory_reset(target="all", yes=False, monkeypatch=None, confirm_input="no"):
-    """Invoke the memory reset logic from cmd_memory in main.py.
+    """Invoke the production reset helper with deterministic confirmation."""
+    from hermes_cli.main import _cmd_memory_reset
 
-    Simulates what happens when `hermes memory reset` is run.
-    """
-    from hermes_constants import get_hermes_home
-
-    mem_dir = get_hermes_home() / "memories"
-    files_to_reset = []
-    if target in {"all", "memory"}:
-        files_to_reset.append(("MEMORY.md", "agent notes"))
-    if target in {"all", "user"}:
-        files_to_reset.append(("USER.md", "user profile"))
-
-    existing = [(f, desc) for f, desc in files_to_reset if (mem_dir / f).exists()]
-    if not existing:
-        return "nothing"
-
-    if not yes:
-        if confirm_input != "yes":
-            return "cancelled"
-
-    for f, desc in existing:
-        (mem_dir / f).unlink()
-
-    return "deleted"
+    args = SimpleNamespace(target=target, yes=yes)
+    with mock_patch("builtins.input", return_value=confirm_input):
+        return _cmd_memory_reset(args)
 
 
 class TestMemoryReset:
     """Tests for `hermes memory reset` subcommand."""
 
     def test_reset_all_with_yes_flag(self, memory_env):
-        """--yes flag should skip confirmation and delete both files."""
+        """--yes flag should delete global, user, and CHAT content."""
         hermes_home, memories = memory_env
         assert (memories / "MEMORY.md").exists()
         assert (memories / "USER.md").exists()
@@ -72,6 +62,8 @@ class TestMemoryReset:
         assert result == "deleted"
         assert not (memories / "MEMORY.md").exists()
         assert not (memories / "USER.md").exists()
+        assert not list((memories / "chat").glob("*.md"))
+        assert (memories / ".chat-target-key").exists()
 
     def test_reset_memory_only(self, memory_env):
         """--target memory should only delete MEMORY.md."""
@@ -90,6 +82,72 @@ class TestMemoryReset:
         assert result == "deleted"
         assert (memories / "MEMORY.md").exists()
         assert not (memories / "USER.md").exists()
+
+    def test_reset_chat_only_preserves_global_user_and_key(self, memory_env):
+        hermes_home, memories = memory_env
+
+        result = _run_memory_reset(target="chat", yes=True)
+
+        assert result == "deleted"
+        assert (memories / "MEMORY.md").exists()
+        assert (memories / "USER.md").exists()
+        assert not list((memories / "chat").glob("*.md"))
+        assert (memories / ".chat-target-key").exists()
+
+    def test_reset_chat_refuses_symlinked_directory(self, memory_env, tmp_path):
+        """A symlinked CHAT directory must not redirect deletion outside the profile."""
+        _hermes_home, memories = memory_env
+        chat_dir = memories / "chat"
+        for path in chat_dir.iterdir():
+            path.unlink()
+        chat_dir.rmdir()
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "3333333333333333.md"
+        secret.write_text("do not delete", encoding="utf-8")
+        try:
+            chat_dir.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+
+        result = _run_memory_reset(target="all", yes=True)
+
+        assert result == "refused"
+        assert secret.read_text(encoding="utf-8") == "do not delete"
+        assert (memories / "MEMORY.md").exists()
+        assert (memories / "USER.md").exists()
+        assert (memories / ".chat-target-key").exists()
+
+    def test_reset_chat_unlinks_symlink_entry_without_following_it(self, memory_env, tmp_path):
+        """A valid-looking CHAT symlink is removed without touching its target."""
+        _hermes_home, memories = memory_env
+        chat_dir = memories / "chat"
+        outside = tmp_path / "outside-entry.md"
+        outside.write_text("external", encoding="utf-8")
+        linked = chat_dir / "3333333333333333.md"
+        try:
+            linked.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"file symlinks unavailable: {exc}")
+
+        result = _run_memory_reset(target="chat", yes=True)
+
+        assert result == "deleted"
+        assert not linked.exists()
+        assert outside.read_text(encoding="utf-8") == "external"
+        assert (memories / ".chat-target-key").exists()
+
+    def test_reset_chat_preserves_unrelated_markdown(self, memory_env):
+        """Only valid opaque CHAT filenames are reset."""
+        _hermes_home, memories = memory_env
+        unrelated = memories / "chat" / "notes.md"
+        unrelated.write_text("keep", encoding="utf-8")
+
+        result = _run_memory_reset(target="chat", yes=True)
+
+        assert result == "deleted"
+        assert unrelated.read_text(encoding="utf-8") == "keep"
 
     def test_reset_no_files_exist(self, tmp_path, monkeypatch):
         """Should return 'nothing' when no memory files exist."""

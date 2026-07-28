@@ -4584,6 +4584,7 @@ class GatewaySlashCommandsMixin:
         a different approach without losing the original.
         Inspired by Claude Code's /branch command.
         """
+        import json as _json
         import uuid as _uuid
 
         if not self._session_db:
@@ -4618,6 +4619,27 @@ class GatewaySlashCommandsMixin:
 
         parent_session_id = current_entry.session_id
 
+        # Branches inherit the parent's frozen prompt as one opaque value. This
+        # preserves CHAT A even when the parent was resumed through physical
+        # route B, without parsing/rebinding CHAT text or persisting a target.
+        parent_row = {}
+        try:
+            parent_row = await self._session_db.get_session(parent_session_id) or {}
+        except Exception:
+            parent_row = {}
+        parent_system_prompt = parent_row.get("system_prompt") or None
+        parent_model = parent_row.get("model")
+        parent_model_config = parent_row.get("model_config") or {}
+        if isinstance(parent_model_config, str):
+            try:
+                parent_model_config = _json.loads(parent_model_config)
+            except (TypeError, ValueError):
+                parent_model_config = {}
+        if not isinstance(parent_model_config, dict):
+            parent_model_config = {}
+        branch_model_config = dict(parent_model_config)
+        branch_model_config["_branched_from"] = parent_session_id
+
         # Create the new session with parent link.
         # Persist a stable ``_branched_from`` marker in model_config so
         # list_sessions_rich() keeps the branch visible in /resume and
@@ -4627,8 +4649,18 @@ class GatewaySlashCommandsMixin:
             await self._session_db.create_session(
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
-                model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
-                model_config={"_branched_from": parent_session_id},
+                model=parent_model or (
+                    (self.config.get("model", {}) or {}).get("default")
+                    if isinstance(self.config, dict)
+                    else None
+                ),
+                model_config=branch_model_config,
+                system_prompt=parent_system_prompt,
+                user_id=getattr(source, "user_id", None),
+                session_key=session_key,
+                chat_id=getattr(source, "chat_id", None),
+                chat_type=getattr(source, "chat_type", None),
+                thread_id=getattr(source, "thread_id", None),
                 parent_session_id=parent_session_id,
             )
         except Exception as e:

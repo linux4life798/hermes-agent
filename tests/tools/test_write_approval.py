@@ -107,6 +107,34 @@ def test_memory_gate_on_then_apply(hermes_home):
     assert "approved entry" in store.user_entries[0]
 
 
+def test_chat_memory_gate_on_then_apply(hermes_home):
+    from tools.memory_tool import memory_tool, MemoryStore, apply_memory_pending
+    from tools import write_approval as wa
+
+    _set_approval("memory", True)
+    target = "chat-0123456789abcdef"
+    store = MemoryStore()
+    store.load_from_disk()
+
+    staged = json.loads(
+        memory_tool("add", target, "Approved CHAT entry", store=store)
+    )
+    assert staged.get("staged") is True
+    record = wa.get_pending("memory", staged["pending_id"])
+    assert record is not None
+
+    result = apply_memory_pending(record["payload"], store)
+
+    assert result["success"] is True
+    from pathlib import Path
+
+    chat_file = (
+        Path(hermes_home) / "memories" / "chat" / "0123456789abcdef.md"
+    )
+    assert chat_file.exists()
+    assert chat_file.read_text(encoding="utf-8") == "Approved CHAT entry"
+
+
 def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, capsys):
     """#46783: ``/memory approve`` from a context with no live agent (e.g. the
     Desktop GUI) passed ``memory_store=None`` into the shared handler, which
