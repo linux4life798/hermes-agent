@@ -42,6 +42,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_url,
+    classify_send_error,
 )
 from gateway.platforms.helpers import redact_phone
 from tools.audio_container import CONTAINER_TO_EXT, sniff_container
@@ -1009,8 +1010,9 @@ class SignalAdapter(BasePlatformAdapter):
 
         When ``raise_on_rate_limit=True``, a Signal ``[429]`` /
         ``RateLimitException`` response raises ``SignalRateLimitError``
-        instead of being swallowed — lets callers (multi-attachment send)
-        opt into backoff-retry without changing default behaviour.
+        instead of returning recipient results — lets callers
+        (multi-attachment send) opt into scheduler-managed backoff. Normal text
+        sends preserve classified failures for the shared send/retry layer.
         """
         if not self.client:
             logger.warning("Signal: RPC called but client not connected")
@@ -1037,11 +1039,95 @@ class SignalAdapter(BasePlatformAdapter):
 
             if "error" in data:
                 err = data["error"]
-                if raise_on_rate_limit:
-                    if _is_signal_rate_limit_error(err):
-                        err_msg = str(err.get("message", "")) if isinstance(err, dict) else str(err)
+                structured_response: Optional[Dict[str, Any]] = None
+                structured_results = None
+                if method == "send" and isinstance(err, dict):
+                    err_data = err.get("data")
+                    if isinstance(err_data, dict):
+                        candidate = err_data.get("response")
+                        if isinstance(candidate, dict):
+                            candidate_results = candidate.get("results")
+                            if isinstance(candidate_results, list):
+                                structured_response = candidate
+                                structured_results = candidate_results
+
+                # signal-cli can wrap a per-recipient send response in a JSON-RPC
+                # error envelope. Preserve those results: text sends need them to
+                # classify rate limits, and mixed-success group sends must not be
+                # retried wholesale after some recipients already received them.
+                if structured_results is not None:
+                    assert structured_response is not None
+                    annotated_response: Dict[str, Any] = {
+                        str(key): value for key, value in structured_response.items()
+                    }
+                    annotated_response["_hermes_rpc_error_envelope"] = True
+                    has_success = any(
+                        isinstance(r, dict)
+                        and (
+                            r.get("type") == "SUCCESS"
+                            or r.get("success") is True
+                        )
+                        for r in structured_results
+                    )
+                    is_rate_limit = _is_signal_rate_limit_error(err) or any(
+                        isinstance(r, dict)
+                        and r.get("type") == "RATE_LIMIT_FAILURE"
+                        for r in structured_results
+                    )
+                    if is_rate_limit:
+                        annotated_response["_hermes_rpc_error_kind"] = "rate_limited"
+                        annotated_response["_hermes_rpc_error_message"] = "Signal rate limited"
                         retry_after = _extract_retry_after_seconds(err)
+                        if retry_after is not None:
+                            annotated_response["_hermes_retry_after_seconds"] = retry_after
+                    else:
+                        annotated_response["_hermes_rpc_error_kind"] = "unknown"
+                        annotated_response["_hermes_rpc_error_message"] = "Signal RPC send failed"
+                    if has_success:
+                        return annotated_response
+                    if raise_on_rate_limit and is_rate_limit:
+                        err_msg = str(err.get("message", ""))
+                        retry_after = annotated_response.get("_hermes_retry_after_seconds")
                         raise SignalRateLimitError(err_msg, retry_after=retry_after)
+                    return annotated_response
+
+                is_rate_limit = _is_signal_rate_limit_error(err)
+                err_msg = (
+                    str(err.get("message", ""))
+                    if isinstance(err, dict)
+                    else str(err)
+                )
+                retry_after = (
+                    _extract_retry_after_seconds(err) if is_rate_limit else None
+                )
+                if raise_on_rate_limit and is_rate_limit:
+                    raise SignalRateLimitError(err_msg, retry_after=retry_after)
+
+                # Text sends must preserve even unstructured JSON-RPC failures
+                # so the shared retry layer can distinguish rate limits from
+                # permanent delivery errors. Keep the synthetic response free
+                # of daemon-provided text because it may contain recipient PII.
+                if method == "send":
+                    error_kind = (
+                        "rate_limited"
+                        if is_rate_limit
+                        else classify_send_error(None, err_msg)
+                    )
+                    failure_result: Dict[str, Any] = {
+                        "_hermes_rpc_error_envelope": True,
+                        "_hermes_rpc_error_kind": error_kind,
+                        "_hermes_rpc_error_message": (
+                            "Signal rate limited"
+                            if is_rate_limit
+                            else "Signal RPC send failed"
+                        ),
+                    }
+                    if retry_after is not None:
+                        failure_result["_hermes_retry_after_seconds"] = retry_after
+                    log = logger.warning if log_failures else logger.debug
+                    log("Signal RPC send error (%s)", error_kind)
+                    return failure_result
+
                 if log_failures:
                     logger.warning("Signal RPC error (%s): %s", method, err)
                 else:
@@ -1052,7 +1138,15 @@ class SignalAdapter(BasePlatformAdapter):
             if isinstance(result, dict) and raise_on_rate_limit:
                 results = result.get("results")
                 if isinstance(results, list):
-                    for r in results:
+                    has_success = any(
+                        isinstance(r, dict)
+                        and (
+                            r.get("type") == "SUCCESS"
+                            or r.get("success") is True
+                        )
+                        for r in results
+                    )
+                    for r in results if not has_success else ():
                         if isinstance(r, dict) and r.get("type") == "RATE_LIMIT_FAILURE":
                             retry_after = r.get("retryAfterSeconds")
                             raise SignalRateLimitError("Rate limit exceeded for recipient", retry_after=retry_after)
@@ -1062,10 +1156,48 @@ class SignalAdapter(BasePlatformAdapter):
         except SignalRateLimitError:
             raise
         except Exception as e:
+            status_code = None
+            response = getattr(e, "response", None)
+            if response is not None:
+                status_code = getattr(response, "status_code", None)
+            error_kind = classify_send_error(status_code, str(e))
+            # A connect failure happens before signal-cli can accept the send,
+            # so retrying is safe. Read/write timeouts remain ``unknown``
+            # because the daemon may already have accepted the message.
+            if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+                error_kind = "transient"
+            elif isinstance(e, (httpx.ReadTimeout, httpx.WriteTimeout)):
+                error_kind = "unknown"
+
+            retry_after = None
+            if response is not None:
+                headers = getattr(response, "headers", {}) or {}
+                try:
+                    retry_after = float(headers.get("Retry-After"))
+                except (TypeError, ValueError):
+                    retry_after = None
+            if raise_on_rate_limit and error_kind == "rate_limited":
+                raise SignalRateLimitError(
+                    "Signal RPC rate limited",
+                    retry_after=retry_after,
+                )
             if log_failures:
-                logger.warning("Signal RPC %s failed: %s", method, e)
+                logger.warning("Signal RPC %s failed (%s)", method, type(e).__name__)
             else:
-                logger.debug("Signal RPC %s failed: %s", method, e)
+                logger.debug("Signal RPC %s failed (%s)", method, type(e).__name__)
+            if method == "send":
+                failure_result: Dict[str, Any] = {
+                    "_hermes_rpc_error_envelope": True,
+                    "_hermes_rpc_error_kind": error_kind,
+                    "_hermes_rpc_error_message": (
+                        "Signal RPC connection failed"
+                        if error_kind == "transient"
+                        else "Signal RPC send failed"
+                    ),
+                }
+                if retry_after is not None:
+                    failure_result["_hermes_retry_after_seconds"] = retry_after
+                return failure_result
             return None
 
     # ------------------------------------------------------------------
@@ -1089,25 +1221,146 @@ class SignalAdapter(BasePlatformAdapter):
     def _validate_send_result(self, result: Any) -> tuple[bool, Optional[str]]:
         """Validate signal-cli send response results.
 
-        Returns (success, error_message).
+        A group send is considered delivered when at least one recipient
+        succeeded. Retrying the whole group after partial delivery would create
+        duplicates for successful recipients, so partial failures are logged
+        without recipient identifiers and returned as success.
+
+        Returns ``(success, error_message)``.
         """
         if not result or not isinstance(result, dict):
             return True, None
 
         results = result.get("results")
         if isinstance(results, list):
+            success_count = 0
+            failures: list[str] = []
             for r in results:
                 if not isinstance(r, dict):
                     continue
                 rtype = r.get("type")
-                if rtype and rtype != "SUCCESS":
-                    return False, str(rtype)
+                if rtype == "SUCCESS" or r.get("success") is True:
+                    success_count += 1
+                    continue
+                if rtype:
+                    failures.append(str(rtype))
+                    continue
                 if "success" in r and not r.get("success"):
-                    fail = r.get("failure")
-                    if fail:
-                        return False, str(fail)
+                    failures.append("LEGACY_FAILURE")
+
+            if success_count:
+                if failures:
+                    failure_counts: Dict[str, int] = {}
+                    for failure in failures:
+                        failure_counts[failure] = failure_counts.get(failure, 0) + 1
+                    summary = ", ".join(
+                        f"{failure}={count}"
+                        for failure, count in sorted(failure_counts.items())
+                    )
+                    logger.warning(
+                        "Signal: partial recipient delivery (%d succeeded, %d failed; %s); "
+                        "not retrying the full group to avoid duplicates",
+                        success_count,
+                        len(failures),
+                        summary,
+                    )
+                return True, None
+            if failures:
+                if failures[0] == "LEGACY_FAILURE":
                     return False, "Recipient delivery failed"
+                return False, failures[0]
+        if result.get("_hermes_rpc_error_envelope"):
+            return False, str(
+                result.get("_hermes_rpc_error_message")
+                or "Signal RPC send failed"
+            )
         return True, None
+
+    @staticmethod
+    def _failed_send_result(result: Any, error_message: Optional[str]) -> SendResult:
+        """Translate signal-cli recipient failures into the shared send contract."""
+        failure_types: list[str] = []
+        legacy_failure_kinds: list[str] = []
+        retry_after_values: list[float] = []
+
+        if isinstance(result, dict):
+            internal_retry_after = result.get("_hermes_retry_after_seconds")
+            try:
+                if internal_retry_after is not None and float(internal_retry_after) >= 0:
+                    retry_after_values.append(float(internal_retry_after))
+            except (TypeError, ValueError):
+                pass
+            recipient_results = result.get("results")
+            if isinstance(recipient_results, list):
+                for recipient_result in recipient_results:
+                    if not isinstance(recipient_result, dict):
+                        continue
+                    failure_type = recipient_result.get("type")
+                    if failure_type and failure_type != "SUCCESS":
+                        failure_types.append(str(failure_type))
+                    elif recipient_result.get("success") is False:
+                        legacy_failure = str(recipient_result.get("failure") or "")
+                        legacy_failure_kinds.append(
+                            classify_send_error(None, legacy_failure)
+                        )
+                    retry_after = recipient_result.get("retryAfterSeconds")
+                    try:
+                        if retry_after is not None and float(retry_after) >= 0:
+                            retry_after_values.append(float(retry_after))
+                    except (TypeError, ValueError):
+                        pass
+
+        failure_type_set = set(failure_types)
+        rpc_error_kind = (
+            result.get("_hermes_rpc_error_kind")
+            if isinstance(result, dict)
+            else None
+        )
+        if (
+            "RATE_LIMIT_FAILURE" in failure_type_set
+            or rpc_error_kind == "rate_limited"
+            or "rate_limited" in legacy_failure_kinds
+        ):
+            error_kind = "rate_limited"
+            retryable = True
+        elif (
+            "NETWORK_FAILURE" in failure_type_set
+            or rpc_error_kind == "transient"
+            or "transient" in legacy_failure_kinds
+        ):
+            error_kind = "transient"
+            retryable = True
+        elif (
+            (failure_type_set and failure_type_set <= {"UNREGISTERED_FAILURE"})
+            or rpc_error_kind == "not_found"
+            or "not_found" in legacy_failure_kinds
+        ):
+            error_kind = "not_found"
+            retryable = False
+        elif rpc_error_kind:
+            error_kind = str(rpc_error_kind)
+            retryable = error_kind in {"rate_limited", "transient"}
+        elif legacy_failure_kinds:
+            error_kind = next(
+                (kind for kind in legacy_failure_kinds if kind != "unknown"),
+                "unknown",
+            )
+            retryable = error_kind in {"rate_limited", "transient"}
+        else:
+            # Convert signal-cli's enum spelling into words so the shared
+            # classifier can recognize e.g. RATE_LIMIT_FAILURE.
+            classification_text = (error_message or "").replace("_", " ")
+            error_kind = classify_send_error(None, classification_text)
+            retryable = error_kind in {"rate_limited", "transient"}
+
+        return SendResult(
+            success=False,
+            error=error_message,
+            raw_response=result,
+            retryable=retryable,
+            retry_after=max(retry_after_values) if retry_after_values else None,
+            error_kind=error_kind,
+        )
 
     # ------------------------------------------------------------------
     # Sending
@@ -1147,12 +1400,12 @@ class SignalAdapter(BasePlatformAdapter):
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:
-                return SendResult(success=False, error=err_msg, raw_response=result)
+                return self._failed_send_result(result, err_msg)
             self._track_sent_timestamp(result)
             # Signal has no editable message identifier. Returning None keeps the
             # stream consumer on the non-edit fallback path instead of pretending
             # future edits can remove an in-progress cursor from the chat thread.
-            return SendResult(success=True, message_id=None)
+            return SendResult(success=True, message_id=None, raw_response=result)
         return SendResult(success=False, error="RPC send failed")
 
     def _track_sent_timestamp(self, rpc_result) -> None:
@@ -1352,6 +1605,22 @@ class SignalAdapter(BasePlatformAdapter):
                         if success:
                             self._track_sent_timestamp(result)
                             await scheduler.report_rpc_duration(_rpc_duration, n)
+                            recipient_results = (
+                                result.get("results", [])
+                                if isinstance(result, dict)
+                                else []
+                            )
+                            if any(
+                                isinstance(item, dict)
+                                and item.get("type") == "RATE_LIMIT_FAILURE"
+                                for item in recipient_results
+                            ):
+                                # Do not resend a partially delivered group
+                                # batch, but retain the server's rate feedback
+                                # so later attachment batches are paced.
+                                scheduler.feedback(
+                                    _extract_retry_after_seconds(result), n
+                                )
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
                                 "(attempt %d/%d)",
@@ -1359,6 +1628,7 @@ class SignalAdapter(BasePlatformAdapter):
                                 attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                             )
                         else:
+                            failed_result = self._failed_send_result(result, err_msg)
                             logger.error(
                                 "Signal: RPC send failed for batch %d/%d (%d attachments, "
                                 "attempt %d/%d, rpc_duration=%.1fs): %s",
@@ -1366,8 +1636,21 @@ class SignalAdapter(BasePlatformAdapter):
                                 attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                                 _rpc_duration, err_msg,
                             )
-                            # Retry transient (non-rate-limit) failures once
-                            if attempt < SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
+                            # _rpc normally raises rate limits when requested,
+                            # but preserve scheduler behavior if a structured
+                            # rate-limit result reaches this path.
+                            if failed_result.error_kind == "rate_limited":
+                                raise SignalRateLimitError(
+                                    failed_result.error or err_msg or "Signal rate limited",
+                                    retry_after=failed_result.retry_after,
+                                )
+                            # Retry only failures known not to have delivered.
+                            # Read/write timeouts are ambiguous and must not
+                            # resend the attachment batch.
+                            if (
+                                failed_result.retryable
+                                and attempt < SIGNAL_RATE_LIMIT_MAX_ATTEMPTS
+                            ):
                                 backoff = 2.0 ** attempt
                                 logger.info(
                                     "Signal: retrying batch %d/%d after %.1fs backoff",
@@ -1376,7 +1659,9 @@ class SignalAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(backoff)
                                 continue
                     else:
-                        # Assume the server didn't accept the batch, don't deduce tokens
+                        # A missing/malformed response does not prove that the
+                        # server rejected the non-idempotent send. Do not retry
+                        # the whole batch because delivery is ambiguous.
                         logger.error(
                             "Signal: RPC send failed for batch %d/%d (%d attachments, "
                             "attempt %d/%d, rpc_duration=%.1fs)",
@@ -1384,15 +1669,6 @@ class SignalAdapter(BasePlatformAdapter):
                             attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                             _rpc_duration,
                         )
-                        # Retry transient (non-rate-limit) failures once
-                        if attempt < SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
-                            backoff = 2.0 ** attempt
-                            logger.info(
-                                "Signal: retrying batch %d/%d after %.1fs backoff",
-                                idx + 1, len(att_batches), backoff,
-                            )
-                            await asyncio.sleep(backoff)
-                            continue
                     break
                 except SignalRateLimitError as e:
                     scheduler.feedback(e.retry_after, n)
@@ -1475,9 +1751,9 @@ class SignalAdapter(BasePlatformAdapter):
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:
-                return SendResult(success=False, error=err_msg, raw_response=result)
+                return self._failed_send_result(result, err_msg)
             self._track_sent_timestamp(result)
-            return SendResult(success=True)
+            return SendResult(success=True, raw_response=result)
         return SendResult(success=False, error="RPC send with attachment failed")
 
     async def _send_attachment(
@@ -1517,9 +1793,9 @@ class SignalAdapter(BasePlatformAdapter):
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:
-                return SendResult(success=False, error=err_msg, raw_response=result)
+                return self._failed_send_result(result, err_msg)
             self._track_sent_timestamp(result)
-            return SendResult(success=True)
+            return SendResult(success=True, raw_response=result)
         return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
 
     async def send_document(

@@ -74,11 +74,9 @@ _RETRY_AFTER_RE = re.compile(r"Retry after (\d+(?:\.\d+)?)\s*second", re.IGNOREC
 def _extract_retry_after_seconds(err: Any) -> Optional[float]:
     """Pull the per-token Retry-After window from a signal-cli rate-limit error.
 
-    Tries two sources, in order:
-    1. ``error.data.response.results[*].retryAfterSeconds`` — the
-       structured field signal-cli ≥ v0.14.3 surfaces for plain
-       RateLimitException.
-    2. ``"Retry after N seconds"`` parsed out of the message — covers
+    Tries structured fields first, including ordinary send results,
+    ``error.data.response`` envelopes, and Hermes's preserved top-level
+    metadata. Then parses ``"Retry after N seconds"`` out of the message — covers
        libsignal-net's RetryLaterException that gets wrapped as
        AttachmentInvalidException during attachment upload, where the
        structured field stays null.
@@ -87,15 +85,30 @@ def _extract_retry_after_seconds(err: Any) -> Optional[float]:
     """
     msg = ""
     if isinstance(err, dict):
-        data = err.get("data") or {}
-        response = data.get("response") or {}
+        candidates = []
+        for key in ("retryAfterSeconds", "_hermes_retry_after_seconds"):
+            value = err.get(key)
+            if value is not None:
+                try:
+                    candidates.append(float(value))
+                except (TypeError, ValueError):
+                    pass
+        data = err.get("data")
+        response = data.get("response") if isinstance(data, dict) else None
+        if not isinstance(response, dict):
+            response = err
         results = response.get("results") or []
-        candidates = [
-            r.get("retryAfterSeconds") for r in results
-            if isinstance(r, dict) and r.get("retryAfterSeconds")
-        ]
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            value = result.get("retryAfterSeconds")
+            if value is not None:
+                try:
+                    candidates.append(float(value))
+                except (TypeError, ValueError):
+                    pass
         if candidates:
-            return float(max(candidates))
+            return max(candidates)
         msg = str(err.get("message", ""))
     else:
         msg = str(err)

@@ -4894,13 +4894,27 @@ class BasePlatformAdapter(ABC):
         base_delay: float = 2.0,
     ) -> "SendResult":
         """
-        Send a message with automatic retry for transient network errors.
+        Send a message with automatic retry for transient delivery errors.
 
-        On permanent failures (e.g. formatting / permission errors) falls back
-        to a plain-text version before giving up. If all attempts fail due to
-        network errors, sends the user a brief delivery-failure notice so they
-        know to retry rather than waiting indefinitely.
+        Uses the shared ``SendResult.error_kind`` vocabulary when available:
+        transient/rate-limited failures retry with backoff, while only an
+        actual ``bad_format`` failure receives a plain-text fallback. Other
+        permanent delivery failures are returned unchanged instead of being
+        mislabeled as formatting errors.
         """
+
+        def _failure_kind(send_result: "SendResult") -> str:
+            return send_result.error_kind or classify_send_error(
+                None, send_result.error or ""
+            )
+
+        def _is_retryable_result(send_result: "SendResult") -> bool:
+            kind = _failure_kind(send_result)
+            return (
+                send_result.retryable
+                or kind in {"rate_limited", "transient"}
+                or self._is_retryable_error(send_result.error or "")
+            )
 
         result = await self.send(
             chat_id=chat_id,
@@ -4913,14 +4927,16 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
-        is_network = result.retryable or self._is_retryable_error(error_str)
+        is_retryable = _is_retryable_result(result)
 
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
-        if not is_network and self._is_timeout_error(error_str):
+        # An adapter can explicitly opt in via retryable=True only when it knows
+        # the platform did not accept the message.
+        if not is_retryable and self._is_timeout_error(error_str):
             return result
 
-        if is_network:
+        if is_retryable:
             # Retry with exponential backoff for transient errors.
             # Honor server-requested retry_after (e.g. Telegram FloodWait)
             # when present — it is authoritative over our backoff schedule.
@@ -4948,8 +4964,8 @@ class BasePlatformAdapter(ABC):
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
-                if not (result.retryable or self._is_retryable_error(error_str)):
-                    break  # error switched to non-transient — fall through to plain-text fallback
+                if not _is_retryable_result(result):
+                    break
             else:
                 # All retries exhausted (loop completed without break) — notify user
                 logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
@@ -4963,7 +4979,19 @@ class BasePlatformAdapter(ABC):
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
-        # Non-network / post-retry formatting failure: try plain text as fallback
+        error_kind = _failure_kind(result)
+        if error_kind != "bad_format":
+            logger.error(
+                "[%s] Send failed with non-format delivery error (%s): %s",
+                self.name,
+                error_kind,
+                error_str,
+            )
+            return result
+
+        # Only a platform-confirmed formatting rejection should trigger this
+        # second send. Retrying arbitrary permanent failures here risks both a
+        # misleading user-visible warning and duplicate partial delivery.
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
             chat_id=chat_id,

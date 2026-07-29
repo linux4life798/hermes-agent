@@ -1,9 +1,11 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
 import base64
+import httpx
 import pytest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
@@ -1420,6 +1422,118 @@ class TestSignalSendResultValidation:
         result = await adapter.send(chat_id="+155****4567", content="hello")
         assert result.success is False
         assert result.error == "UNREGISTERED_FAILURE"
+        assert result.error_kind == "not_found"
+        assert result.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_send_rate_limit_failure_uses_shared_retry_metadata(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"number": "+155****4567"},
+                    "type": "RATE_LIMIT_FAILURE",
+                    "retryAfterSeconds": 15,
+                }
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send(chat_id="+155****4567", content="hello")
+
+        assert result.success is False
+        assert result.error == "RATE_LIMIT_FAILURE"
+        assert result.error_kind == "rate_limited"
+        assert result.retryable is True
+        assert result.retry_after == 15.0
+
+    @pytest.mark.asyncio
+    async def test_group_partial_success_is_not_retried_or_format_fallback(
+        self, monkeypatch, caplog
+    ):
+        """A full-group resend would duplicate the message for successful recipients."""
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, calls = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"uuid": "recipient-a"},
+                    "type": "SUCCESS",
+                },
+                {
+                    "recipientAddress": {"uuid": "recipient-b"},
+                    "type": "RATE_LIMIT_FAILURE",
+                    "retryAfterSeconds": 15,
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry(
+                chat_id="group:test-group",
+                content="**hello**",
+                max_retries=2,
+                base_delay=0,
+            )
+
+        assert result.success is True
+        assert len(calls) == 1
+        mock_sleep.assert_not_awaited()
+        assert "partial" in caplog.text.lower()
+        assert "recipient-a" not in caplog.text
+        assert "recipient-b" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_all_rate_limited_group_send_retries_without_formatting_prefix(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        responses = iter([
+            {
+                "timestamp": 1712345678000,
+                "results": [
+                    {
+                        "recipientAddress": {"uuid": "recipient-a"},
+                        "type": "RATE_LIMIT_FAILURE",
+                        "retryAfterSeconds": 15,
+                    }
+                ],
+            },
+            {
+                "timestamp": 1712345679000,
+                "results": [
+                    {
+                        "recipientAddress": {"uuid": "recipient-a"},
+                        "type": "SUCCESS",
+                    }
+                ],
+            },
+        ])
+        calls = []
+
+        async def mock_rpc(method, params, rpc_id=None):
+            calls.append(dict(params))
+            return next(responses)
+
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry(
+                chat_id="group:test-group",
+                content="**hello**",
+                max_retries=2,
+                base_delay=0,
+            )
+
+        assert result.success is True
+        assert len(calls) == 2
+        assert mock_sleep.await_args.args[0] >= 15.0
+        assert all("Response formatting failed" not in call["message"] for call in calls)
 
     @pytest.mark.asyncio
     async def test_send_failure_when_results_has_success_false(self, monkeypatch):
@@ -1439,7 +1553,36 @@ class TestSignalSendResultValidation:
 
         result = await adapter.send(chat_id="+155****4567", content="hello")
         assert result.success is False
-        assert result.error == "Some connection error"
+        assert result.error == "Recipient delivery failed"
+        assert result.error_kind == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_partial_legacy_failure_log_does_not_expose_recipient(self, monkeypatch, caplog):
+        adapter = _make_signal_adapter(monkeypatch)
+        private_failure = "recipient +15551234567 uuid 11111111-2222-3333-4444-555555555555 failed"
+        mock_rpc, _ = _stub_rpc({
+            "timestamp": 1712345678000,
+            "results": [
+                {"recipientAddress": {"uuid": "recipient-a"}, "type": "SUCCESS"},
+                {
+                    "recipientAddress": {"uuid": "recipient-b"},
+                    "success": False,
+                    "failure": private_failure,
+                },
+            ],
+        })
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(chat_id="group:test-group", content="hello")
+
+        assert result.success is True
+        combined = "\n".join(record.getMessage() for record in caplog.records)
+        assert private_failure not in combined
+        assert "+15551234567" not in combined
+        assert "11111111-2222-3333-4444-555555555555" not in combined
+        assert "LEGACY_FAILURE=1" in combined
 
     @pytest.mark.asyncio
     async def test_rpc_raises_rate_limit_on_results_failure(self, monkeypatch):
@@ -1985,26 +2128,201 @@ class TestSignalRpcRateLimit:
             await adapter._rpc("send", {}, raise_on_rate_limit=True)
 
     @pytest.mark.asyncio
-    async def test_default_swallows_rate_limit_returns_none(self, monkeypatch):
-        """Without opt-in, 429 stays swallowed — preserves backwards compat."""
+    async def test_default_text_send_returns_unstructured_rate_limit_metadata(
+        self, monkeypatch
+    ):
+        """Text sends route even non-recipient 429 envelopes through shared retry."""
         adapter = _make_signal_adapter(monkeypatch)
         _install_fake_client(adapter, {
-            "error": {"message": "[429] Rate Limited"},
+            "error": {"message": "[429] Rate Limited. Retry after 23 seconds"},
         })
+        adapter._stop_typing_indicator = AsyncMock()
 
-        result = await adapter._rpc("send", {})
-        assert result is None
+        result = await adapter.send(chat_id="+155****4567", content="hello")
+
+        assert result.success is False
+        assert result.error == "Signal rate limited"
+        assert result.error_kind == "rate_limited"
+        assert result.retryable is True
+        assert result.retry_after == 23.0
 
     @pytest.mark.asyncio
-    async def test_non_rate_limit_error_does_not_raise_when_opted_in(self, monkeypatch):
-        """Opt-in only escalates 429s; other errors still return None."""
+    async def test_non_rate_limit_error_does_not_raise_or_log_details_when_opted_in(
+        self, monkeypatch, caplog
+    ):
+        """Non-429 send errors stay structured and daemon text remains private."""
         adapter = _make_signal_adapter(monkeypatch)
+        private_error = (
+            "Recipient +155****4567 uuid "
+            "11111111-2222-3333-4444-555555555555 is untrusted"
+        )
         _install_fake_client(adapter, {
-            "error": {"message": "Recipient unknown (UntrustedIdentityException)"},
+            "error": {"message": private_error},
+        })
+
+        with caplog.at_level("WARNING"):
+            result = await adapter._rpc("send", {}, raise_on_rate_limit=True)
+
+        assert result["_hermes_rpc_error_envelope"] is True
+        assert result["_hermes_rpc_error_kind"] == "unknown"
+        assert result["_hermes_rpc_error_message"] == "Signal RPC send failed"
+        rpc_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "gateway.platforms.signal"
+            and "Signal RPC send error" in record.getMessage()
+        ]
+        assert rpc_logs == ["Signal RPC send error (unknown)"]
+
+    @pytest.mark.asyncio
+    async def test_partial_success_does_not_raise_recipient_rate_limit(self, monkeypatch):
+        """A partial group result must reach validation instead of full-group retry."""
+        adapter = _make_signal_adapter(monkeypatch)
+        rpc_result = {
+            "timestamp": 1712345678000,
+            "results": [
+                {"recipientAddress": {"uuid": "recipient-a"}, "type": "SUCCESS"},
+                {
+                    "recipientAddress": {"uuid": "recipient-b"},
+                    "type": "RATE_LIMIT_FAILURE",
+                    "retryAfterSeconds": 15,
+                },
+            ],
+        }
+        _install_fake_client(adapter, {
+            "error": {
+                "message": "Failed to send message due to rate limiting",
+                "data": {"response": rpc_result},
+            }
         })
 
         result = await adapter._rpc("send", {}, raise_on_rate_limit=True)
-        assert result is None
+
+        assert result["timestamp"] == rpc_result["timestamp"]
+        assert result["results"] == rpc_result["results"]
+        assert result["_hermes_rpc_error_envelope"] is True
+        assert result["_hermes_rpc_error_kind"] == "rate_limited"
+
+    @pytest.mark.asyncio
+    async def test_default_returns_structured_recipient_failures(self, monkeypatch):
+        """Text send callers need error-envelope results for shared classification."""
+        adapter = _make_signal_adapter(monkeypatch)
+        rpc_result = {
+            "timestamp": 1712345678000,
+            "results": [
+                {
+                    "recipientAddress": {"uuid": "recipient-a"},
+                    "type": "RATE_LIMIT_FAILURE",
+                    "retryAfterSeconds": 15,
+                },
+            ],
+        }
+        _install_fake_client(adapter, {
+            "error": {
+                "message": "Failed to send message due to rate limiting",
+                "data": {"response": rpc_result},
+            }
+        })
+
+        result = await adapter._rpc("send", {})
+
+        assert result["timestamp"] == rpc_result["timestamp"]
+        assert result["results"] == rpc_result["results"]
+        assert result["_hermes_rpc_error_kind"] == "rate_limited"
+
+    @pytest.mark.asyncio
+    async def test_error_envelope_with_empty_results_is_not_success(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        _install_fake_client(adapter, {
+            "error": {
+                "message": "Signal send failed",
+                "data": {"response": {"timestamp": 0, "results": []}},
+            }
+        })
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send(chat_id="+155****4567", content="hello")
+
+        assert result.success is False
+        assert result.error == "Signal RPC send failed"
+        assert result.error_kind == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_text_send_uses_retry_after_from_error_message(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        _install_fake_client(adapter, {
+            "error": {
+                "message": "Failed to send: [429] Rate Limited. Retry after 37 seconds",
+                "data": {
+                    "response": {
+                        "timestamp": 0,
+                        "results": [{"type": "RATE_LIMIT_FAILURE"}],
+                    }
+                },
+            }
+        })
+        adapter._stop_typing_indicator = AsyncMock()
+
+        result = await adapter.send(chat_id="+155****4567", content="hello")
+
+        assert result.success is False
+        assert result.error_kind == "rate_limited"
+        assert result.retryable is True
+        assert result.retry_after == 37.0
+
+    @pytest.mark.asyncio
+    async def test_connect_error_retries_but_read_timeout_does_not(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        attempts = {"connect": 0}
+
+        async def _connect_then_succeed(url, json=None, timeout=None):
+            attempts["connect"] += 1
+            if attempts["connect"] == 1:
+                raise httpx.ConnectError(
+                    "connection refused",
+                    request=httpx.Request("POST", url),
+                )
+            return _FakeHttpResponse({
+                "result": {
+                    "timestamp": 1712345678000,
+                    "results": [{"type": "SUCCESS"}],
+                }
+            })
+
+        adapter.client = SimpleNamespace(post=_connect_then_succeed)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            connect_result = await adapter._send_with_retry(
+                chat_id="+155****4567",
+                content="hello",
+                max_retries=2,
+                base_delay=0,
+            )
+
+        assert connect_result.success is True
+        assert attempts["connect"] == 2
+
+        read_attempts = {"count": 0}
+
+        async def _read_timeout(url, json=None, timeout=None):
+            read_attempts["count"] += 1
+            raise httpx.ReadTimeout(
+                "read timed out",
+                request=httpx.Request("POST", url),
+            )
+
+        adapter.client = SimpleNamespace(post=_read_timeout)
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            timeout_result = await adapter._send_with_retry(
+                chat_id="+155****4567",
+                content="hello",
+                max_retries=2,
+                base_delay=0,
+            )
+
+        assert timeout_result.success is False
+        assert timeout_result.error_kind == "unknown"
+        assert read_attempts["count"] == 1
 
     @pytest.mark.asyncio
     async def test_raises_with_retry_after_from_v0_14_3_payload(self, monkeypatch):
@@ -2227,6 +2545,104 @@ class TestSignalSendMultipleImages:
 
         assert len(captured) == 1
         assert len(captured[0]["params"]["attachments"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_partial_recipient_success_does_not_retry_group(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.platforms.signal_rate_limit import get_scheduler
+
+        adapter = _make_signal_adapter(monkeypatch)
+        feedback = MagicMock()
+        monkeypatch.setattr(get_scheduler(), "feedback", feedback)
+        mock_rpc, captured = _stub_rpc_responses([{
+            "timestamp": 1712345678000,
+            "results": [
+                {"type": "SUCCESS"},
+                {"type": "RATE_LIMIT_FAILURE", "retryAfterSeconds": 30},
+            ],
+        }])
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        await adapter.send_multiple_images(
+            chat_id="group:abc123==",
+            images=_make_image_files(tmp_path, 1),
+        )
+
+        assert len(captured) == 1
+        feedback.assert_called_once_with(30.0, 1)
+
+    @pytest.mark.asyncio
+    async def test_batch_connect_error_retries_when_delivery_not_attempted(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        attempts = {"count": 0}
+
+        async def _connect_then_succeed(url, json=None, timeout=None):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise httpx.ConnectError(
+                    "connection refused",
+                    request=httpx.Request("POST", url),
+                )
+            return _FakeHttpResponse({
+                "result": {
+                    "timestamp": 1712345678000,
+                    "results": [{"type": "SUCCESS"}],
+                }
+            })
+
+        adapter.client = SimpleNamespace(post=_connect_then_succeed)
+        with patch("gateway.platforms.signal.asyncio.sleep", new_callable=AsyncMock):
+            await adapter.send_multiple_images(
+                chat_id="+155****4567",
+                images=_make_image_files(tmp_path, 1),
+            )
+
+        assert attempts["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_batch_read_timeout_does_not_retry_ambiguous_delivery(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._stop_typing_indicator = AsyncMock()
+        attempts = {"count": 0}
+
+        async def _read_timeout(url, json=None, timeout=None):
+            attempts["count"] += 1
+            raise httpx.ReadTimeout(
+                "read timed out",
+                request=httpx.Request("POST", url),
+            )
+
+        adapter.client = SimpleNamespace(post=_read_timeout)
+        with patch("gateway.platforms.signal.asyncio.sleep", new_callable=AsyncMock):
+            await adapter.send_multiple_images(
+                chat_id="+155****4567",
+                images=_make_image_files(tmp_path, 1),
+            )
+
+        assert attempts["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_batch_missing_response_does_not_retry_ambiguous_delivery(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        mock_rpc, captured = _stub_rpc_responses([None])
+        adapter._rpc = mock_rpc
+        adapter._stop_typing_indicator = AsyncMock()
+
+        await adapter.send_multiple_images(
+            chat_id="+155****4567",
+            images=_make_image_files(tmp_path, 1),
+        )
+
+        assert len(captured) == 1
 
     @pytest.mark.asyncio
     async def test_429_calibrates_scheduler_then_retries(self, monkeypatch, tmp_path):

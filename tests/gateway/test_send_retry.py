@@ -3,7 +3,7 @@ Tests for BasePlatformAdapter._send_with_retry and _is_retryable_error.
 
 Verifies that:
 - Transient network errors trigger retry with backoff
-- Permanent errors fall back to plain-text immediately (no retry)
+- Only formatting errors fall back to plain text; other permanent failures do not resend
 - User receives a delivery-failure notice when all retries are exhausted
 - Successful sends on retry return success
 - SendResult.retryable flag is respected
@@ -272,11 +272,71 @@ class TestSendWithRetryFallback:
         assert "plain text" in adapter._send_calls[1][1].lower()
 
     @pytest.mark.asyncio
+    async def test_typed_bad_format_falls_back_even_without_parse_substring(self):
+        """The shared error_kind contract, not provider text, selects fallback."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="provider rejected payload", error_kind="bad_format"),
+            SendResult(success=True, message_id="fallback_ok"),
+        ]
+
+        result = await adapter._send_with_retry("chat1", "**bold**", max_retries=2)
+
+        assert result.success
+        assert len(adapter._send_calls) == 2
+        assert "formatting failed" in adapter._send_calls[1][1].lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_kind", ["forbidden", "not_found", "unknown"])
+    async def test_non_format_delivery_failure_does_not_send_formatting_fallback(
+        self, error_kind
+    ):
+        """Permanent delivery failures must not be mislabeled as formatting."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="provider delivery failure", error_kind=error_kind),
+        ]
+
+        result = await adapter._send_with_retry("chat1", "hello", max_retries=2)
+
+        assert not result.success
+        assert len(adapter._send_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_error_kind_uses_shared_retry_path(self):
+        """Adapters can connect rate limits to retry without text matching."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="provider throttle",
+                error_kind="rate_limited",
+                retry_after=17.0,
+            ),
+            SendResult(success=True, message_id="ok"),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2)
+
+        assert result.success
+        assert len(adapter._send_calls) == 2
+        assert mock_sleep.await_args.args[0] >= 17.0
+
+    @pytest.mark.asyncio
     async def test_fallback_failure_logged_but_not_raised(self):
         adapter = _StubAdapter()
         adapter._send_results = [
-            SendResult(success=False, error="Forbidden: bot blocked"),
-            SendResult(success=False, error="Forbidden: bot blocked"),
+            SendResult(
+                success=False,
+                error="Bad Request: can't parse entities",
+                error_kind="bad_format",
+            ),
+            SendResult(
+                success=False,
+                error="Bad Request: can't parse entities",
+                error_kind="bad_format",
+            ),
         ]
         with patch("asyncio.sleep", new_callable=AsyncMock):
             result = await adapter._send_with_retry("chat1", "hello", max_retries=2)
