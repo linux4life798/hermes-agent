@@ -6454,6 +6454,7 @@ class BasePlatformAdapter(ABC):
         role_authorized: bool = False,
         auto_thread_created: bool = False,
         auto_thread_initial_name: Optional[str] = None,
+        chat_topic_known: bool = False,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform.
 
@@ -6489,6 +6490,7 @@ class BasePlatformAdapter(ABC):
                         guild_id=str(guild_id) if guild_id else None,
                         parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
                         message_id=str(message_id) if message_id else None,
+                        chat_topic_known=chat_topic_known,
                     )
                 )
             except Exception:
@@ -6517,6 +6519,7 @@ class BasePlatformAdapter(ABC):
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
+            chat_topic_known=chat_topic_known,
         )
         # In-process transport provenance is deliberately not serialized by
         # SessionSource.to_dict(). The live receiving adapter is authoritative

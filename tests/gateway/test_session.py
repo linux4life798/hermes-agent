@@ -65,6 +65,21 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_topic == "Planning and coordination for Project X"
         assert restored.chat_name == "Server / #project-planning"
 
+    def test_chat_topic_known_roundtrip(self):
+        """An authoritative empty topic must survive persistence."""
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="group:abc",
+            chat_type="group",
+            chat_topic=None,
+            chat_topic_known=True,
+        )
+
+        restored = SessionSource.from_dict(source.to_dict())
+
+        assert restored.chat_topic is None
+        assert restored.chat_topic_known is True
+
     def test_minimal_roundtrip(self):
         source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
         d = source.to_dict()
@@ -813,6 +828,93 @@ class TestNeutralizeUntrustedInlineText:
 
     def test_non_string_input_stringified(self):
         assert neutralize_untrusted_inline_text(12345) == "12345"
+
+
+class TestSessionStoreRefreshesChatMetadata:
+    @staticmethod
+    def _config():
+        return GatewayConfig(group_sessions_per_user=False)
+
+    @staticmethod
+    def _source(
+        *,
+        name="Original name",
+        topic="Original topic",
+        topic_known=True,
+        user_id="user-1",
+        user_name="Alice",
+    ):
+        return SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="group:abc",
+            chat_name=name,
+            chat_type="group",
+            user_id=user_id,
+            user_name=user_name,
+            chat_topic=topic,
+            chat_topic_known=topic_known,
+        )
+
+    def test_existing_session_refreshes_chat_metadata_and_persistence(
+        self, tmp_path, monkeypatch
+    ):
+        store = SessionStore(sessions_dir=tmp_path, config=self._config())
+        original = self._source()
+        entry = store.get_or_create_session(original)
+        session_id = entry.session_id
+        record_peer = MagicMock()
+        monkeypatch.setattr(store, "_record_gateway_session_peer", record_peer)
+
+        refreshed = store.get_or_create_session(
+            self._source(
+                name="Renamed group",
+                topic="Current purpose",
+                user_id="user-2",
+                user_name="Bob",
+            )
+        )
+
+        assert refreshed.session_id == session_id
+        assert refreshed.origin.chat_name == "Renamed group"
+        assert refreshed.origin.chat_topic == "Current purpose"
+        assert refreshed.display_name == "Renamed group"
+        # Participant identity is turn-specific; persisted chat metadata must
+        # not rewrite the session owner to whichever group member spoke last.
+        assert refreshed.origin.user_id == "user-1"
+        assert refreshed.origin.user_name == "Alice"
+        record_peer.assert_called_once_with(
+            session_id,
+            refreshed.session_key,
+            refreshed.origin,
+            display_name="Renamed group",
+        )
+
+        persisted = json.loads((tmp_path / "sessions.json").read_text())
+        persisted_origin = persisted[refreshed.session_key]["origin"]
+        assert persisted_origin["chat_name"] == "Renamed group"
+        assert persisted_origin["chat_topic"] == "Current purpose"
+
+    def test_authoritative_empty_topic_clears_persisted_topic(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=self._config())
+        store.get_or_create_session(self._source())
+
+        refreshed = store.get_or_create_session(
+            self._source(topic=None, topic_known=True)
+        )
+
+        assert refreshed.origin.chat_topic is None
+        assert refreshed.origin.chat_topic_known is True
+
+    def test_unknown_empty_topic_preserves_last_known_topic(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=self._config())
+        store.get_or_create_session(self._source())
+
+        refreshed = store.get_or_create_session(
+            self._source(topic=None, topic_known=False)
+        )
+
+        assert refreshed.origin.chat_topic == "Original topic"
+        assert refreshed.origin.chat_topic_known is True
 
 
 class TestSessionStoreRewriteTranscript:

@@ -162,7 +162,7 @@ class SessionSource:
     user_id: Optional[str] = None
     user_name: Optional[str] = None
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
-    chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
+    chat_topic: Optional[str] = None  # Channel/group topic or description
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
     is_bot: bool = False  # True when the message author is a bot/webhook (Discord)
@@ -191,6 +191,11 @@ class SessionSource:
     auto_thread_created: bool = False
     auto_thread_initial_name: Optional[str] = None
 
+    # Distinguishes a confirmed absent/cleared topic from metadata that the
+    # adapter did not fetch. Kept after established constructor fields to avoid
+    # changing positional-call semantics; non-empty topics imply True.
+    chat_topic_known: bool = False
+
     # Internal, wire-INVISIBLE trust signal: True when this event was delivered
     # to the gateway over the per-instance-authenticated relay WebSocket (the
     # Team Gateway connector). The connector authenticates the gateway's socket
@@ -205,6 +210,9 @@ class SessionSource:
     delivered_via_upstream_relay: bool = False
 
     def __post_init__(self) -> None:
+        if self.chat_topic is not None:
+            self.chat_topic_known = True
+
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
         # (scope_id wins on conflict) so internal readers of EITHER field see the
@@ -248,6 +256,8 @@ class SessionSource:
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
+        if self.chat_topic_known:
+            d["chat_topic_known"] = True
         if self.chat_id_alt:
             d["chat_id_alt"] = self.chat_id_alt
         # D-Q2.5 dual-write: emit BOTH the canonical `scope_id` and the
@@ -281,6 +291,7 @@ class SessionSource:
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
             chat_topic=data.get("chat_topic"),
+            chat_topic_known=bool(data.get("chat_topic_known", False)),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
             # D-Q2.5 dual-read: prefer the canonical `scope_id`, fall back to the
@@ -2106,6 +2117,41 @@ class SessionStore:
         entry.session_id = canonical_session_id
         return True
 
+    @staticmethod
+    def _refresh_entry_chat_metadata(
+        entry: "SessionEntry", source: SessionSource
+    ) -> bool:
+        """Refresh mutable chat labels without replacing participant identity.
+
+        A session route is stable while its group/channel name and topic can
+        change repeatedly. Persist only those chat-level labels so synthetic
+        continuations and scheduled deliveries inherit the latest metadata;
+        keep the original participant fields because shared group sessions may
+        receive each turn from a different person.
+        """
+        origin = entry.origin
+        if origin is None:
+            return False
+
+        changed = False
+        if source.chat_name is not None:
+            if source.chat_name != origin.chat_name:
+                origin.chat_name = source.chat_name
+                changed = True
+            if source.chat_name != entry.display_name:
+                entry.display_name = source.chat_name
+                changed = True
+
+        topic_is_authoritative = source.chat_topic_known or source.chat_topic is not None
+        if topic_is_authoritative and (
+            source.chat_topic != origin.chat_topic or not origin.chat_topic_known
+        ):
+            origin.chat_topic = source.chat_topic
+            origin.chat_topic_known = True
+            changed = True
+
+        return changed
+
     def has_any_sessions(self) -> bool:
         """Check if any sessions have ever been created (across all platforms).
 
@@ -2299,6 +2345,7 @@ class SessionStore:
         # ---- Phase 2: lock write -- apply decisions to _entries ----
         _needs_save = False
         _needs_recover = False
+        _chat_metadata_changed = False
         entry: Optional[SessionEntry] = None
         was_auto_reset = False
         auto_reset_reason = None
@@ -2359,6 +2406,9 @@ class SessionStore:
                         _needs_recover = True
                     else:
                         entry.updated_at = now
+                        _chat_metadata_changed = self._refresh_entry_chat_metadata(
+                            entry, source
+                        )
                         _needs_save = True
             else:
                 if not force_new:
@@ -2427,6 +2477,14 @@ class SessionStore:
 
         if _needs_save:
             self._save_entries()
+
+        if _chat_metadata_changed:
+            self._record_gateway_session_peer(
+                entry.session_id,
+                session_key,
+                entry.origin,
+                display_name=entry.display_name,
+            )
 
         # SQLite operations outside the lock (unchanged).
         if self._db and db_end_session_id:

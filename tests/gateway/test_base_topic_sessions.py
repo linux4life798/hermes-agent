@@ -68,6 +68,19 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
 
 
 class TestBasePlatformTopicSessions:
+    def test_build_source_preserves_authoritative_empty_topic(self):
+        adapter = DummyTelegramAdapter()
+
+        source = adapter.build_source(
+            chat_id="-1001",
+            chat_type="group",
+            chat_topic="",
+            chat_topic_known=True,
+        )
+
+        assert source.chat_topic is None
+        assert source.chat_topic_known is True
+
     @pytest.mark.asyncio
     async def test_handle_message_does_not_interrupt_different_topic(self, monkeypatch):
         adapter = DummyTelegramAdapter()

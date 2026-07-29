@@ -199,6 +199,7 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         ),
         thread_id=src.get("thread_id"),
         chat_topic=src.get("chat_topic"),
+        chat_topic_known=bool(src.get("chat_topic_known", False)),
         user_id_alt=src.get("user_id_alt"),
         chat_id_alt=src.get("chat_id_alt"),
         scope_id=src.get("scope_id"),
