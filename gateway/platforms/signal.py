@@ -24,6 +24,7 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -71,11 +72,30 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+# ``listGroups(groupId=[...])`` forces signal-cli to refresh that Group V2
+# record from Signal.  On real accounts this can take substantially longer than
+# the normal 30-second RPC budget, so description refreshes use a dedicated
+# background-only timeout and never delay inbound message handling.
+SIGNAL_GROUP_DESCRIPTION_RPC_TIMEOUT = 120.0
+SIGNAL_GROUP_DESCRIPTION_RETRY_DELAY = 30.0
+SIGNAL_GROUP_DESCRIPTION_MAX_RETRY_DELAY = 300.0
+SIGNAL_GROUP_DESCRIPTION_MAX_RETRIES = 6
+SIGNAL_GROUP_DESCRIPTION_CACHE_LIMIT = 256
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _GroupDescriptionRefreshRequest:
+    """One coalesced group-description invalidation."""
+
+    generation: int
+    target_revision: Optional[int]
+    revision_floor: Optional[int]
+    revisionless_generation: Optional[int]
 
 
 def _parse_comma_list(value: str) -> List[str]:
@@ -395,6 +415,28 @@ class SignalAdapter(BasePlatformAdapter):
         self._recipient_number_by_uuid: Dict[str, str] = {}
         self._recipient_cache_lock = asyncio.Lock()
 
+        # Signal's receive JSON exposes a group's current name, revision, and
+        # whether the envelope is a group update, but not its description.  The
+        # description is available through listGroups. Keep a revision-aware cache
+        # so long-lived gateways learn changes from UPDATE envelopes (or a later
+        # DELIVER envelope with a newer revision) without startup scans or blocking
+        # user messages on a slow RPC. Suppress cached values while invalidated.
+        self._group_descriptions: Dict[str, Optional[str]] = {}
+        self._group_description_revisions: Dict[str, int] = {}
+        # One adapter-wide worker serializes the expensive forced Group V2
+        # refreshes. Each request records the newest observed Signal revision
+        # and an exclusive revision floor. The floor makes
+        # a revisionless UPDATE require an actual revision advance when a
+        # listGroups response supplies revisions; generations still preserve
+        # ordering when the deployed signal-cli omits them.
+        self._group_description_refresh_requests: Dict[
+            str, _GroupDescriptionRefreshRequest
+        ] = {}
+        self._group_description_retry_after: Dict[str, float] = {}
+        self._group_description_retry_attempts: Dict[str, int] = {}
+        self._group_description_refresh_event = asyncio.Event()
+        self._group_description_refresh_task: Optional[asyncio.Task] = None
+
         logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
                      self.http_url, redact_phone(self.account),
                      "enabled" if self.group_allow_from else "disabled")
@@ -465,6 +507,8 @@ class SignalAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
 
+        await self._reset_group_description_state()
+
         # Cancel all typing tasks
         for task in self._typing_tasks.values():
             task.cancel()
@@ -486,6 +530,7 @@ class SignalAdapter(BasePlatformAdapter):
         """Listen for SSE events from signal-cli daemon."""
         url = f"{self.http_url}/api/v1/events?account={quote(self.account, safe='')}"
         backoff = SSE_RETRY_DELAY_INITIAL
+        connected_once = False
 
         while self._running:
             try:
@@ -495,6 +540,13 @@ class SignalAdapter(BasePlatformAdapter):
                     headers={"Accept": "text/event-stream"},
                     timeout=None,
                 ) as response:
+                    if connected_once:
+                        # Signal's SSE endpoint does not replay the gap. Any
+                        # cached description may have changed while disconnected,
+                        # so make the next message refresh it instead of treating
+                        # a revisionless DELIVER as proof that the cache is current.
+                        await self._reset_group_description_state()
+                    connected_once = True
                     self._sse_response = response
                     backoff = SSE_RETRY_DELAY_INITIAL  # Reset on successful connection
                     self._last_sse_activity = time.time()
@@ -589,6 +641,376 @@ class SignalAdapter(BasePlatformAdapter):
             self._sse_response = None
 
     # ------------------------------------------------------------------
+    # Group description metadata
+    # ------------------------------------------------------------------
+
+    async def _reset_group_description_state(self) -> None:
+        """Cancel pending refreshes and invalidate metadata after a receive gap."""
+        description_task = self._group_description_refresh_task
+        if (
+            description_task is not None
+            and description_task is not asyncio.current_task()
+            and not description_task.done()
+        ):
+            description_task.cancel()
+            await asyncio.gather(description_task, return_exceptions=True)
+        self._group_description_refresh_task = None
+        self._group_description_refresh_requests.clear()
+        self._group_description_retry_after.clear()
+        self._group_description_retry_attempts.clear()
+        self._group_description_refresh_event.clear()
+        self._group_descriptions.clear()
+        self._group_description_revisions.clear()
+
+    @staticmethod
+    def _group_revision(group_info: Any) -> Optional[int]:
+        """Return a non-negative Signal group revision when one is present."""
+        if not isinstance(group_info, dict):
+            return None
+        raw_revision = group_info.get("revision")
+        if raw_revision is None:
+            return None
+        try:
+            revision = int(raw_revision)
+        except (TypeError, ValueError):
+            return None
+        return revision if revision >= 0 else None
+
+    def _group_description_context(
+        self,
+        group_id: str,
+        revision: Optional[int],
+    ) -> Tuple[Optional[str], bool]:
+        """Return (description, authoritative) for the current envelope.
+
+        Any queued invalidation suppresses the old value, including revisionless
+        UPDATE events. Missing context is preferable to injecting a purpose that
+        the group has already changed. The boolean distinguishes a confirmed
+        empty description from metadata that is merely unavailable or stale.
+        """
+        if (
+            group_id not in self._group_descriptions
+            or group_id in self._group_description_refresh_requests
+        ):
+            return None, False
+        cached_revision = self._group_description_revisions.get(group_id, -1)
+        if revision is not None and revision > cached_revision:
+            return None, False
+        description = self._group_descriptions.pop(group_id)
+        self._group_descriptions[group_id] = description
+        if group_id in self._group_description_revisions:
+            cached_revision = self._group_description_revisions.pop(group_id)
+            self._group_description_revisions[group_id] = cached_revision
+        return description, True
+
+    def _store_group_description(
+        self,
+        group_id: str,
+        description: Optional[str],
+        revision: Optional[int],
+    ) -> None:
+        """Publish one authoritative result and bound long-lived cache state."""
+        self._group_descriptions.pop(group_id, None)
+        self._group_descriptions[group_id] = description
+        if revision is not None:
+            self._group_description_revisions.pop(group_id, None)
+            self._group_description_revisions[group_id] = revision
+
+        while len(self._group_descriptions) > SIGNAL_GROUP_DESCRIPTION_CACHE_LIMIT:
+            oldest_group = next(iter(self._group_descriptions))
+            self._group_descriptions.pop(oldest_group, None)
+            self._group_description_revisions.pop(oldest_group, None)
+
+    def _maybe_schedule_group_description_refresh(
+        self,
+        group_id: str,
+        group_info: Any,
+    ) -> None:
+        """Refresh a missing or revision-stale group description in background."""
+        if not group_id:
+            return
+        revision = self._group_revision(group_info)
+        is_update = (
+            isinstance(group_info, dict)
+            and str(group_info.get("type") or "").upper() == "UPDATE"
+        )
+        cached_revision = self._group_description_revisions.get(group_id, -1)
+        pending = self._group_description_refresh_requests.get(group_id)
+        pending_revision = pending.target_revision if pending is not None else None
+        pending_revision_floor = pending.revision_floor if pending is not None else None
+        revisionless_generation = (
+            pending.revisionless_generation if pending is not None else None
+        )
+        highest_requested_revision = max(
+            cached_revision,
+            pending_revision if pending_revision is not None else -1,
+            pending_revision_floor if pending_revision_floor is not None else -1,
+        )
+
+        if group_id not in self._group_descriptions:
+            should_enqueue = (
+                pending is None
+                or (revision is not None and revision > highest_requested_revision)
+                or (is_update and revision is None)
+            )
+        elif revision is not None:
+            should_enqueue = revision > highest_requested_revision
+        else:
+            # An UPDATE without a revision is still an invalidation. Increment a
+            # local generation even when another RPC is in flight so it cannot
+            # be mistaken for the request that RPC already covers.
+            should_enqueue = is_update
+
+        if not should_enqueue:
+            return
+
+        generation = (pending.generation if pending is not None else 0) + 1
+        requested_revision = max(
+            revision if revision is not None else -1,
+            pending_revision if pending_revision is not None else -1,
+        )
+        revision_floor = pending_revision_floor
+        if (
+            revision is not None
+            and revision_floor is not None
+            and revision >= revision_floor
+        ):
+            # A later explicit revision gives the request a concrete inclusive
+            # target, so the older revisionless floor is no longer needed.
+            revision_floor = None
+            revisionless_generation = None
+        if is_update and revision is None:
+            required_advance_after = max(
+                cached_revision,
+                pending_revision if pending_revision is not None else -1,
+                pending_revision_floor if pending_revision_floor is not None else -1,
+            )
+            revision_floor = (
+                required_advance_after if required_advance_after >= 0 else None
+            )
+            revisionless_generation = generation
+        self._group_description_refresh_requests[group_id] = (
+            _GroupDescriptionRefreshRequest(
+                generation=generation,
+                target_revision=(
+                    requested_revision if requested_revision >= 0 else None
+                ),
+                revision_floor=revision_floor,
+                revisionless_generation=revisionless_generation,
+            )
+        )
+        # A new invalidation supersedes any retry budget/backoff accumulated by
+        # an older request for this group.
+        self._group_description_retry_after.pop(group_id, None)
+        self._group_description_retry_attempts[group_id] = 0
+        self._group_description_refresh_event.set()
+
+        existing = self._group_description_refresh_task
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(self._run_group_description_refreshes())
+        self._group_description_refresh_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_group_description_refreshes(self) -> None:
+        """Drain description invalidations with one fair, retrying worker."""
+        current_task = asyncio.current_task()
+        try:
+            while self._group_description_refresh_requests:
+                now = time.monotonic()
+                group_id = next(
+                    (
+                        pending_group
+                        for pending_group in self._group_description_refresh_requests
+                        if self._group_description_retry_after.get(pending_group, 0.0)
+                        <= now
+                    ),
+                    None,
+                )
+                if group_id is None:
+                    retry_at = min(
+                        self._group_description_retry_after.get(pending_group, now)
+                        for pending_group in self._group_description_refresh_requests
+                    )
+                    self._group_description_refresh_event.clear()
+                    try:
+                        await asyncio.wait_for(
+                            self._group_description_refresh_event.wait(),
+                            timeout=max(0.0, retry_at - now),
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+
+                request = self._group_description_refresh_requests[group_id]
+                generation = request.generation
+                target_revision = request.target_revision
+                revision_floor = request.revision_floor
+                try:
+                    refreshed, description, fetched_revision = (
+                        await self._refresh_group_description(group_id)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.debug(
+                        "Signal: unexpected group description refresh failure",
+                        exc_info=True,
+                    )
+                    refreshed, description, fetched_revision = False, None, None
+
+                current_request = self._group_description_refresh_requests.get(
+                    group_id
+                )
+                known_revision = self._group_description_revisions.get(group_id)
+                minimum_revision = max(
+                    (
+                        revision
+                        for revision in (target_revision, known_revision)
+                        if revision is not None
+                    ),
+                    default=None,
+                )
+                revision_lagging = (
+                    refreshed
+                    and fetched_revision is not None
+                    and (
+                        (
+                            minimum_revision is not None
+                            and fetched_revision < minimum_revision
+                        )
+                        or (
+                            revision_floor is not None
+                            and fetched_revision <= revision_floor
+                        )
+                    )
+                )
+                if refreshed and not revision_lagging:
+                    self._group_description_retry_after.pop(group_id, None)
+                    self._group_description_retry_attempts.pop(group_id, None)
+                    effective_revision = (
+                        fetched_revision
+                        if fetched_revision is not None
+                        else target_revision
+                    )
+                    if effective_revision is not None and known_revision is not None:
+                        effective_revision = max(
+                            self._group_description_revisions.get(group_id, -1),
+                            effective_revision,
+                        )
+                    # Publish only after revision validation. A targeted
+                    # listGroups call can briefly return the daemon's prior
+                    # stored revision while an update is still being applied.
+                    self._store_group_description(
+                        group_id,
+                        description,
+                        effective_revision,
+                    )
+                    if (
+                        current_request is not None
+                        and current_request.generation == generation
+                    ):
+                        self._group_description_refresh_requests.pop(group_id, None)
+                    elif current_request is not None:
+                        if (
+                            effective_revision is not None
+                            and current_request.revisionless_generation is not None
+                            and current_request.revisionless_generation > generation
+                        ):
+                            # The newer revisionless invalidation arrived while
+                            # this RPC was running. Its follow-up RPC must advance
+                            # beyond the revision this older RPC just confirmed.
+                            current_request = _GroupDescriptionRefreshRequest(
+                                generation=current_request.generation,
+                                target_revision=current_request.target_revision,
+                                revision_floor=max(
+                                    current_request.revision_floor
+                                    if current_request.revision_floor is not None
+                                    else -1,
+                                    effective_revision,
+                                ),
+                                revisionless_generation=(
+                                    current_request.revisionless_generation
+                                ),
+                            )
+                            self._group_description_refresh_requests[group_id] = (
+                                current_request
+                            )
+                        # A newer invalidation arrived mid-RPC. Move it behind
+                        # other groups so one noisy group cannot starve the queue.
+                        self._group_description_refresh_requests.pop(group_id, None)
+                        self._group_description_refresh_requests[group_id] = current_request
+                else:
+                    if revision_lagging:
+                        logger.debug(
+                            "Signal: group description refresh lagged requested revision"
+                        )
+                    retry_attempt = (
+                        self._group_description_retry_attempts.get(group_id, 0) + 1
+                    )
+                    if retry_attempt >= SIGNAL_GROUP_DESCRIPTION_MAX_RETRIES:
+                        # Stop a permanently failing group from keeping the
+                        # worker and stale metadata alive forever. A later
+                        # message starts a fresh bounded attempt series.
+                        self._group_description_refresh_requests.pop(group_id, None)
+                        self._group_description_retry_after.pop(group_id, None)
+                        self._group_description_retry_attempts.pop(group_id, None)
+                        self._group_descriptions.pop(group_id, None)
+                        self._group_description_revisions.pop(group_id, None)
+                    elif current_request is not None:
+                        self._group_description_retry_attempts[group_id] = retry_attempt
+                        retry_delay = min(
+                            SIGNAL_GROUP_DESCRIPTION_RETRY_DELAY
+                            * (2 ** max(0, retry_attempt - 1)),
+                            SIGNAL_GROUP_DESCRIPTION_MAX_RETRY_DELAY,
+                        )
+                        self._group_description_retry_after[group_id] = (
+                            time.monotonic() + retry_delay
+                        )
+                        self._group_description_refresh_requests.pop(group_id, None)
+                        self._group_description_refresh_requests[group_id] = current_request
+        finally:
+            if self._group_description_refresh_task is current_task:
+                self._group_description_refresh_task = None
+
+    async def _refresh_group_description(
+        self, group_id: str
+    ) -> Tuple[bool, Optional[str], Optional[int]]:
+        """Fetch one group's current description from signal-cli.
+
+        Supplying ``groupId`` is important: it avoids serializing every group
+        while asking signal-cli to refresh the one record whose revision changed.
+        The RPC is serialized across groups because signal-cli's forced Group V2
+        refresh is expensive and concurrent refreshes only increase contention.
+        """
+        groups = await self._rpc(
+            "listGroups",
+            {
+                "account": self.account,
+                "groupId": [group_id],
+            },
+            rpc_id="listGroups_description",
+            log_failures=False,
+            timeout=SIGNAL_GROUP_DESCRIPTION_RPC_TIMEOUT,
+        )
+
+        if not isinstance(groups, list):
+            return False, None, None
+        for group in groups:
+            if not isinstance(group, dict) or str(group.get("id") or "") != group_id:
+                continue
+            raw_description = group.get("description")
+            description = (
+                str(raw_description).strip()
+                if raw_description is not None
+                else ""
+            )
+            return True, description or None, self._group_revision(group)
+        return False, None, None
+
+    # ------------------------------------------------------------------
     # Message Handling
     # ------------------------------------------------------------------
 
@@ -667,6 +1089,7 @@ class SignalAdapter(BasePlatformAdapter):
             if "*" not in self.group_allow_from and group_id not in self.group_allow_from:
                 logger.debug("Signal: group %s not in allowlist", group_id[:8] if group_id else "?")
                 return
+            self._maybe_schedule_group_description_refresh(group_id, group_info)
 
         # Build chat info
         chat_id = sender if not is_group else f"group:{group_id}"
@@ -767,6 +1190,14 @@ class SignalAdapter(BasePlatformAdapter):
             )
             return
 
+        if is_group:
+            chat_topic, chat_topic_known = self._group_description_context(
+                group_id,
+                self._group_revision(group_info),
+            )
+        else:
+            chat_topic, chat_topic_known = None, False
+
         # Build session source
         source = self.build_source(
             chat_id=chat_id,
@@ -776,6 +1207,8 @@ class SignalAdapter(BasePlatformAdapter):
             user_name=sender_name or sender,
             user_id_alt=sender_uuid if sender_uuid else None,
             chat_id_alt=group_id if is_group else None,
+            chat_topic=chat_topic,
+            chat_topic_known=chat_topic_known,
         )
 
         # Determine message type from media

@@ -6,6 +6,7 @@ import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
@@ -103,6 +104,814 @@ class TestSignalAdapterInit:
     def test_self_message_filtering(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
         assert adapter._account_normalized == "+15551234567"
+
+
+class TestSignalGroupDescriptions:
+    @staticmethod
+    def _group_envelope(
+        *,
+        message: str = "hello group",
+        revision: Optional[int] = 1,
+        group_type: str = "DELIVER",
+    ) -> dict:
+        return {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceName": "Alice",
+                "timestamp": 1712345678000,
+                "dataMessage": {
+                    "message": message,
+                    "groupInfo": {
+                        "groupId": "group123",
+                        "groupName": "House",
+                        "revision": revision,
+                        "type": group_type,
+                    },
+                },
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_refreshes_only_the_active_group_in_background(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+        rpc_calls = []
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            rpc_calls.append((method, params, kwargs))
+            refresh_started.set()
+            await release_refresh.wait()
+            return [{"id": "group123", "description": "House coordination"}]
+
+        adapter._rpc = fake_rpc
+        handled = []
+
+        async def fake_handle(event):
+            handled.append(event)
+
+        adapter.handle_message = fake_handle
+
+        await adapter._handle_envelope(self._group_envelope())
+        await refresh_started.wait()
+
+        assert handled[0].source.chat_topic is None
+        assert len(rpc_calls) == 1
+        assert rpc_calls[0][0] == "listGroups"
+        assert rpc_calls[0][1] == {
+            "account": "bot-account",
+            "groupId": ["group123"],
+        }
+        assert rpc_calls[0][2]["log_failures"] is False
+        assert rpc_calls[0][2]["timeout"] > 30
+
+        release_refresh.set()
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        await adapter._handle_envelope(self._group_envelope(message="second message"))
+
+        assert handled[-1].source.chat_topic == "House coordination"
+        assert len(rpc_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_group_update_suppresses_stale_topic_until_refresh_completes(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Old purpose"
+        adapter._group_description_revisions["group123"] = 3
+        release_refresh = asyncio.Event()
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            await release_refresh.wait()
+            return [{"id": "group123", "description": "New purpose"}]
+
+        adapter._rpc = fake_rpc
+        handled = []
+
+        async def fake_handle(event):
+            handled.append(event)
+
+        adapter.handle_message = fake_handle
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=4, group_type="UPDATE")
+        )
+
+        assert handled == []
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="message during refresh", revision=4)
+        )
+        assert handled[-1].source.chat_topic is None
+
+        release_refresh.set()
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="message after refresh", revision=4)
+        )
+        assert handled[-1].source.chat_topic == "New purpose"
+
+    @pytest.mark.asyncio
+    async def test_description_clear_is_cached_without_repeated_refreshes(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Old purpose"
+        adapter._group_description_revisions["group123"] = 8
+        adapter._rpc = AsyncMock(
+            return_value=[{"id": "group123", "description": "   "}]
+        )
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=9, group_type="UPDATE")
+        )
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="after clear", revision=9)
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_topic is None
+        assert "group123" in adapter._group_descriptions
+        assert adapter._group_descriptions["group123"] is None
+        adapter._rpc.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_newer_revision_during_refresh_is_coalesced_and_rechecked(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+                return [{"id": "group123", "description": "Revision four"}]
+            return [{"id": "group123", "description": "Revision five"}]
+
+        adapter._rpc = fake_rpc
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=4, group_type="UPDATE")
+        )
+        await first_started.wait()
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=5, group_type="UPDATE")
+        )
+
+        release_first.set()
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        assert calls == 2
+        assert adapter._group_descriptions["group123"] == "Revision five"
+        assert adapter._group_description_revisions["group123"] == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("event_revision", "cached_revision", "stale_revision", "fresh_revision"),
+        [
+            (4, 2, 3, 4),
+            (None, 5, 4, 6),
+        ],
+    )
+    async def test_revision_lagging_refresh_is_retried_before_publish(
+        self,
+        monkeypatch,
+        event_revision,
+        cached_revision,
+        stale_revision,
+        fresh_revision,
+    ):
+        from gateway.platforms import signal as signal_module
+
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Previously confirmed"
+        adapter._group_description_revisions["group123"] = cached_revision
+        monkeypatch.setattr(signal_module, "SIGNAL_GROUP_DESCRIPTION_RETRY_DELAY", 0)
+        calls = 0
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            revision = stale_revision if calls == 1 else fresh_revision
+            return [
+                {
+                    "id": "group123",
+                    "description": f"Revision {revision}",
+                    "revision": revision,
+                }
+            ]
+
+        adapter._rpc = fake_rpc
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(
+                message="",
+                revision=event_revision,
+                group_type="UPDATE",
+            )
+        )
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        assert calls == 2
+        assert adapter._group_descriptions["group123"] == f"Revision {fresh_revision}"
+        assert adapter._group_description_revisions["group123"] == fresh_revision
+
+    @pytest.mark.asyncio
+    async def test_failed_refresh_keeps_stale_value_but_does_not_inject_it(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Old purpose"
+        adapter._group_description_revisions["group123"] = 2
+        adapter._rpc = AsyncMock(return_value=None)
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="new revision", revision=3)
+        )
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        for _ in range(10):
+            if adapter._rpc.await_count:
+                break
+            await asyncio.sleep(0)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_topic is None
+        assert adapter._group_descriptions["group123"] == "Old purpose"
+        assert adapter._group_description_revisions["group123"] == 2
+        await adapter.disconnect()
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_disallowed_group_does_not_trigger_metadata_rpc(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="different-group",
+        )
+        adapter._rpc = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(self._group_envelope())
+        await asyncio.sleep(0)
+
+        adapter._rpc.assert_not_awaited()
+        adapter.handle_message.assert_not_awaited()
+        assert adapter._group_description_refresh_task is None
+        assert adapter._group_description_refresh_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_inflight_description_refresh(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        refresh_started = asyncio.Event()
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            refresh_started.set()
+            await asyncio.Event().wait()
+
+        adapter._rpc = fake_rpc
+        adapter._maybe_schedule_group_description_refresh(
+            "group123",
+            {"revision": 1, "type": "DELIVER"},
+        )
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await refresh_started.wait()
+
+        await adapter.disconnect()
+
+        assert task.cancelled()
+        assert adapter._group_description_refresh_task is None
+        assert adapter._group_description_refresh_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_revisionless_update_invalidates_cache_and_is_not_lost(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Old purpose"
+        adapter._group_description_revisions["group123"] = 3
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+                return [
+                    {
+                        "id": "group123",
+                        "description": "Intermediate purpose",
+                        "revision": 4,
+                    }
+                ]
+            return [
+                {
+                    "id": "group123",
+                    "description": "Latest purpose",
+                    "revision": 5,
+                }
+            ]
+
+        adapter._rpc = fake_rpc
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=4, group_type="UPDATE")
+        )
+        await first_started.wait()
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=None, group_type="UPDATE")
+        )
+        await adapter._handle_envelope(
+            self._group_envelope(
+                message="message during refresh",
+                revision=None,
+                group_type="DELIVER",
+            )
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_topic is None
+
+        release_first.set()
+        await adapter._group_description_refresh_task
+
+        assert calls == 2
+        assert adapter._group_descriptions["group123"] == "Latest purpose"
+        assert adapter._group_description_revisions["group123"] == 5
+
+    @pytest.mark.asyncio
+    async def test_revision_omitting_response_started_after_update_is_authoritative(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Old purpose"
+        adapter._group_description_revisions["group123"] = 3
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+                description = "Intermediate purpose"
+            else:
+                description = "Latest purpose"
+            # Deployed signal-cli v0.14.6 listGroups does not expose a
+            # revision, so ordering comes from starting another targeted RPC
+            # after the revisionless invalidation.
+            return [{"id": "group123", "description": description}]
+
+        adapter._rpc = fake_rpc
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=4, group_type="UPDATE")
+        )
+        await first_started.wait()
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=None, group_type="UPDATE")
+        )
+        release_first.set()
+
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        assert calls == 2
+        assert adapter._group_descriptions["group123"] == "Latest purpose"
+        assert adapter._group_description_revisions["group123"] == 4
+
+    @pytest.mark.asyncio
+    async def test_revisionless_update_requires_revision_advance_when_available(
+        self, monkeypatch
+    ):
+        from gateway.platforms import signal as signal_module
+
+        monkeypatch.setattr(signal_module, "SIGNAL_GROUP_DESCRIPTION_RETRY_DELAY", 0)
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Revision three"
+        adapter._group_description_revisions["group123"] = 3
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+            revision = 4 if calls < 3 else 5
+            return [
+                {
+                    "id": "group123",
+                    "description": f"Revision {revision}",
+                    "revision": revision,
+                }
+            ]
+
+        adapter._rpc = fake_rpc
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=4, group_type="UPDATE")
+        )
+        await first_started.wait()
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=None, group_type="UPDATE")
+        )
+
+        release_first.set()
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        assert calls == 3
+        assert adapter._group_descriptions["group123"] == "Revision 5"
+        assert adapter._group_description_revisions["group123"] == 5
+
+    @pytest.mark.asyncio
+    async def test_repeated_revisionless_updates_advance_floor_during_each_rpc(
+        self, monkeypatch
+    ):
+        from gateway.platforms import signal as signal_module
+
+        monkeypatch.setattr(signal_module, "SIGNAL_GROUP_DESCRIPTION_RETRY_DELAY", 0)
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Revision three"
+        adapter._group_description_revisions["group123"] = 3
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        second_started = asyncio.Event()
+        release_second = asyncio.Event()
+        calls = 0
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+                revision = 4
+            elif calls == 2:
+                second_started.set()
+                await release_second.wait()
+                revision = 5
+            elif calls == 3:
+                revision = 5
+            else:
+                revision = 6
+            return [
+                {
+                    "id": "group123",
+                    "description": f"Revision {revision}",
+                    "revision": revision,
+                }
+            ]
+
+        adapter._rpc = fake_rpc
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=4, group_type="UPDATE")
+        )
+        await first_started.wait()
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=None, group_type="UPDATE")
+        )
+        release_first.set()
+
+        await second_started.wait()
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=None, group_type="UPDATE")
+        )
+        release_second.set()
+
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        assert calls == 4
+        assert adapter._group_descriptions["group123"] == "Revision 6"
+        assert adapter._group_description_revisions["group123"] == 6
+
+    @pytest.mark.asyncio
+    async def test_failed_refresh_retries_without_waiting_for_another_message(
+        self, monkeypatch
+    ):
+        from gateway.platforms import signal as signal_module
+
+        monkeypatch.setattr(
+            signal_module,
+            "SIGNAL_GROUP_DESCRIPTION_RETRY_DELAY",
+            0.01,
+        )
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        calls = 0
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return None
+            return [
+                {
+                    "id": "group123",
+                    "description": "Recovered purpose",
+                    "revision": 7,
+                }
+            ]
+
+        adapter._rpc = fake_rpc
+        adapter._maybe_schedule_group_description_refresh(
+            "group123",
+            {"revision": 7, "type": "UPDATE"},
+        )
+
+        await adapter._group_description_refresh_task
+
+        assert calls == 2
+        assert adapter._group_descriptions["group123"] == "Recovered purpose"
+        assert adapter._group_description_revisions["group123"] == 7
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_is_bounded_and_does_not_starve_other_groups(
+        self, monkeypatch
+    ):
+        from gateway.platforms import signal as signal_module
+
+        monkeypatch.setattr(signal_module, "SIGNAL_GROUP_DESCRIPTION_RETRY_DELAY", 0)
+        monkeypatch.setattr(signal_module, "SIGNAL_GROUP_DESCRIPTION_MAX_RETRIES", 2)
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="*",
+        )
+        calls = []
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            group_id = params["groupId"][0]
+            calls.append(group_id)
+            if group_id == "failing-group":
+                return None
+            return [
+                {
+                    "id": group_id,
+                    "description": "Healthy purpose",
+                    "revision": 1,
+                }
+            ]
+
+        adapter._rpc = fake_rpc
+        adapter._maybe_schedule_group_description_refresh(
+            "failing-group",
+            {"revision": 1, "type": "UPDATE"},
+        )
+        adapter._maybe_schedule_group_description_refresh(
+            "healthy-group",
+            {"revision": 1, "type": "UPDATE"},
+        )
+
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        assert calls == ["failing-group", "healthy-group", "failing-group"]
+        assert adapter._group_descriptions == {"healthy-group": "Healthy purpose"}
+        assert adapter._group_description_refresh_requests == {}
+        assert adapter._group_description_retry_after == {}
+        assert adapter._group_description_refresh_task is None
+
+    @pytest.mark.asyncio
+    async def test_description_cache_evicts_oldest_entries(self, monkeypatch):
+        from gateway.platforms import signal as signal_module
+
+        monkeypatch.setattr(signal_module, "SIGNAL_GROUP_DESCRIPTION_CACHE_LIMIT", 3)
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="*",
+        )
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            group_id = params["groupId"][0]
+            return [{"id": group_id, "description": group_id, "revision": 1}]
+
+        adapter._rpc = fake_rpc
+        for index in range(5):
+            adapter._maybe_schedule_group_description_refresh(
+                f"group-{index}",
+                {"revision": 1, "type": "UPDATE"},
+            )
+
+        task = adapter._group_description_refresh_task
+        assert task is not None
+        await task
+
+        assert list(adapter._group_descriptions) == ["group-2", "group-3", "group-4"]
+        assert set(adapter._group_description_revisions) == {
+            "group-2",
+            "group-3",
+            "group-4",
+        }
+
+    @pytest.mark.asyncio
+    async def test_many_groups_share_one_description_refresh_worker(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="*",
+        )
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+
+        async def fake_rpc(method, params, rpc_id=None, **kwargs):
+            refresh_started.set()
+            await release_refresh.wait()
+            group_id = params["groupId"][0]
+            return [{"id": group_id, "description": group_id, "revision": 1}]
+
+        adapter._rpc = fake_rpc
+        for index in range(100):
+            adapter._maybe_schedule_group_description_refresh(
+                f"group-{index}",
+                {"revision": 1, "type": "UPDATE"},
+            )
+
+        await refresh_started.wait()
+
+        assert adapter._group_description_refresh_task is not None
+        assert not adapter._group_description_refresh_task.done()
+        assert len(adapter._group_description_refresh_requests) == 100
+
+        release_refresh.set()
+        await adapter._group_description_refresh_task
+        assert len(adapter._group_descriptions) == 100
+
+    @pytest.mark.asyncio
+    async def test_confirmed_empty_description_is_authoritative_topic_metadata(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._rpc = AsyncMock(
+            return_value=[
+                {"id": "group123", "description": "", "revision": 9}
+            ]
+        )
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(
+            self._group_envelope(message="", revision=9, group_type="UPDATE")
+        )
+        await adapter._group_description_refresh_task
+        await adapter._handle_envelope(
+            self._group_envelope(message="after clear", revision=9)
+        )
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_topic is None
+        assert event.source.chat_topic_known is True
+
+    @pytest.mark.asyncio
+    async def test_reconnect_reset_prevents_revisionless_delivery_from_using_stale_cache(
+        self, monkeypatch
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            account="bot-account",
+            group_allowed="group123",
+        )
+        adapter._group_descriptions["group123"] = "Old purpose"
+        adapter._group_description_revisions["group123"] = 2
+        refresh_started = asyncio.Event()
+
+        async def blocked_rpc(*args, **kwargs):
+            refresh_started.set()
+            await asyncio.Event().wait()
+
+        adapter._rpc = blocked_rpc
+        adapter._maybe_schedule_group_description_refresh(
+            "group123",
+            {"revision": 3, "type": "UPDATE"},
+        )
+        stale_task = adapter._group_description_refresh_task
+        assert stale_task is not None
+        await refresh_started.wait()
+
+        await adapter._reset_group_description_state()
+
+        assert stale_task.cancelled()
+        assert adapter._group_descriptions == {}
+        assert adapter._group_description_revisions == {}
+        assert adapter._group_description_refresh_requests == {}
+
+        adapter._rpc = AsyncMock(
+            return_value=[{"id": "group123", "description": "Fresh purpose"}]
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_envelope(
+            self._group_envelope(message="after reconnect", revision=None)
+        )
+
+        source = adapter.handle_message.await_args.args[0].source
+        assert source.chat_topic is None
+        assert source.chat_topic_known is False
+        replacement_task = adapter._group_description_refresh_task
+        assert replacement_task is not None
+        await replacement_task
+
+        adapter.handle_message.reset_mock()
+        await adapter._handle_envelope(
+            self._group_envelope(message="after refresh", revision=None)
+        )
+        source = adapter.handle_message.await_args.args[0].source
+        assert source.chat_topic == "Fresh purpose"
+        assert source.chat_topic_known is True
 
 
 class TestSignalConnectCleanup:
@@ -541,6 +1350,60 @@ class TestSignalSSEUrlEncoding:
     def test_sse_url_encoding_preserves_digits(self):
         """Digits and country codes should pass through URL encoding unchanged."""
         assert quote("+15551234567", safe="") == "%2B15551234567"
+
+
+class TestSignalSSEReconnectDescriptionInvalidation:
+    @pytest.mark.asyncio
+    async def test_second_sse_connection_invalidates_description_cache(
+        self, monkeypatch
+    ):
+        from gateway.platforms import signal as signal_module
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._group_descriptions["group123"] = "Old purpose"
+        adapter._group_description_revisions["group123"] = 2
+        stream_count = 0
+
+        class Response:
+            is_stream_consumed = False
+
+            def __init__(self, stop: bool):
+                self.stop = stop
+
+            async def aiter_text(self):
+                if self.stop:
+                    adapter._running = False
+                if False:
+                    yield ""
+
+        class StreamContext:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        def stream(*args, **kwargs):
+            nonlocal stream_count
+            stream_count += 1
+            return StreamContext(Response(stop=stream_count == 2))
+
+        async def no_sleep(_delay):
+            return None
+
+        adapter.client = MagicMock()
+        adapter.client.stream = stream
+        adapter._running = True
+        monkeypatch.setattr(signal_module.asyncio, "sleep", no_sleep)
+
+        await adapter._sse_listener()
+
+        assert stream_count == 2
+        assert adapter._group_descriptions == {}
+        assert adapter._group_description_revisions == {}
 
 
 # ---------------------------------------------------------------------------
